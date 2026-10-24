@@ -1,0 +1,235 @@
+{
+ "card": "glm53-2x3090",
+ "config": "G067-1g-ct-combo | -cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4 | GLM53_ZC_VRAM=0 GLM53_ZC_STATS=/w/glm53/data/stats_own_dec.json GLM53_EC=1 GLM53_EC_WARM=/w/glm53/data/stats_own_dec.json GLM53_EC_RESERVE_GB=1.5 GLM53_EC_STAGE_GB=2.6 GLM53_EC_TIMING=1 GLM53_MEM=250g GLM53_CPU_TIER=1 GLM53_CT_THREADS=22 GLM53_CT_CPUS=2-23 GLM53_EC_ELASTIC_GB=10 GLM53_K_HCFUSE=1 GLM53_K_FTSPLIT=1 GLM53_K_OVL=1 GLM53_TRITON_PIN=/w/glm53/data/triton_pin_cumsum_bs32.json",
+ "started": "2026-10-01T10:27:17+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {},
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 709.7,
+   "min": 695.4,
+   "max": 710.6,
+   "n": 3,
+   "all": [
+    695.4,
+    709.7,
+    710.6
+   ]
+  },
+  "32768": {
+   "median": 950.8,
+   "min": 950.4,
+   "max": 952.3,
+   "n": 3,
+   "all": [
+    950.8,
+    952.3,
+    950.4
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 28.15,
+    "min": 27.36,
+    "max": 28.94,
+    "n": 2,
+    "all": [
+     28.94,
+     27.36
+    ]
+   },
+   "per_stream_mean": {
+    "median": 28.130000000000003,
+    "min": 27.34,
+    "max": 28.92,
+    "n": 2,
+    "all": [
+     28.92,
+     27.34
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 28.94,
+     "per_stream_mean": 28.92,
+     "per_stream_min": 28.92,
+     "tokens": 1783,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.61
+    },
+    {
+     "aggregate": 27.36,
+     "per_stream_mean": 27.34,
+     "per_stream_min": 27.34,
+     "tokens": 1490,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.48
+    }
+   ]
+  },
+  "C2": {
+   "aggregate": {
+    "median": 31.57,
+    "min": 31.54,
+    "max": 31.6,
+    "n": 2,
+    "all": [
+     31.6,
+     31.54
+    ]
+   },
+   "per_stream_mean": {
+    "median": 15.780000000000001,
+    "min": 15.76,
+    "max": 15.8,
+    "n": 2,
+    "all": [
+     15.8,
+     15.76
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 31.6,
+     "per_stream_mean": 15.8,
+     "per_stream_min": 12.86,
+     "tokens": 2787,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 3.81
+    },
+    {
+     "aggregate": 31.54,
+     "per_stream_mean": 15.76,
+     "per_stream_min": 13.65,
+     "tokens": 3981,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 2.81
+    }
+   ]
+  },
+  "C4": {
+   "aggregate": {
+    "median": 33.975,
+    "min": 33.77,
+    "max": 34.18,
+    "n": 2,
+    "all": [
+     33.77,
+     34.18
+    ]
+   },
+   "per_stream_mean": {
+    "median": 8.625,
+    "min": 8.57,
+    "max": 8.68,
+    "n": 2,
+    "all": [
+     8.57,
+     8.68
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 33.77,
+     "per_stream_mean": 8.57,
+     "per_stream_min": 5.57,
+     "tokens": 7607,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 6.4
+    },
+    {
+     "aggregate": 34.18,
+     "per_stream_mean": 8.68,
+     "per_stream_min": 5.84,
+     "tokens": 8508,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.83
+    }
+   ]
+  },
+  "C1@32k": {
+   "aggregate": {
+    "median": 26.89,
+    "min": 26.13,
+    "max": 27.65,
+    "n": 2,
+    "all": [
+     26.13,
+     27.65
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 26.13,
+     "per_stream_mean": 26.12,
+     "per_stream_min": 26.12,
+     "tokens": 4097,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 32.49
+    },
+    {
+     "aggregate": 27.65,
+     "per_stream_mean": 27.64,
+     "per_stream_min": 27.64,
+     "tokens": 2423,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.53
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "gates": {
+  "prefill_8192": {
+   "value": 709.7,
+   "best_known": null,
+   "pass": true
+  },
+  "prefill_32768": {
+   "value": 950.8,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 28.15,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C4": {
+   "value": 33.98,
+   "best_known": null,
+   "pass": true
+  }
+ },
+ "finished": "2026-10-01T10:48:04+0200"
+}

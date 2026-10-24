@@ -1,0 +1,19 @@
+prefill 8192: 645.5 tok/s
+prefill 8192: 670.3 tok/s
+prefill 8192: 662.4 tok/s
+prefill 32768: 973.2 tok/s
+prefill 32768: 965.4 tok/s
+prefill 32768: 965.0 tok/s
+decode C1: aggregate 17.27 tok/s, per-stream 17.26
+decode C2: aggregate 17.84 tok/s, per-stream 9.65
+Traceback (most recent call last):
+  File "/home/sero/freetoken-exl3/runs/N116-glm53-nvme/s2/hom272/sweep_marks.py", line 289, in <module>
+    main()
+    ~~~~^^
+  File "/home/sero/freetoken-exl3/runs/N116-glm53-nvme/s2/hom272/sweep_marks.py", line 254, in main
+    rounds = [run_conc(c, r) for r in range(a.dec_reps)]
+              ~~~~~~~~^^^^^^
+  File "/home/sero/freetoken-exl3/runs/N116-glm53-nvme/s2/hom272/sweep_marks.py", line 244, in run_conc
+    raise RuntimeError(f"decode C{c} round {rnd} failed: {[e['error'] for e in errors]}; receipts saved in {a.out}")
+RuntimeError: decode C4 round 1 failed: ['<urlopen error [Errno 111] Connection refused>', '<urlopen error [Errno 111] Connection refused>', '<urlopen error [Errno 111] Connection refused>', '<urlopen error [Errno 111] Connection refused>']; receipts saved in runs/N116-glm53-nvme/s2/hom272/runs/n129_pfon/sweep.json
+sweep exit 1

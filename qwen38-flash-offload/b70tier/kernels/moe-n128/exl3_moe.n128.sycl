@@ -1,0 +1,1654 @@
+// Grouped EXL3 (trellis, mul1) MoE for Intel Xe2 (Arc Pro B70), expert weights addressed through a POINTER TABLE.
+//
+// Expert blob (one contiguous allocation per expert, 64-byte aligned; H = hidden, I = intermediate, W = 8K words/tile):
+//   [0]                 gate|up trellis  uint32 [H/16][2I/16][W]   (per k-row: I/16 gate tiles, then I/16 up tiles)
+//   [+GU]               down trellis     uint32 [I/16][H/16][W]
+//   then fp16 vectors   suh_g[H] suh_u[H] svh_g[I] svh_u[I] suh_d[I] svh_d[H]
+// For Qwen3.8-Flash-Next (H=2560, I=640, K=3) a blob is 1,862,400 B.
+// PLANAR4 word order (default; required by these kernels when D = K/gcd(K,32) > 1): within every k-row the tiles
+// are grouped by 4 along n, and each group's 4*W words are stored plane-major: word (tile t, period g, plane i) at
+// [i][t][g] instead of [t][D*g + i] (g < 8 periods per tile for K=3). This is exactly GemvKernel's register
+// planarization, done once at pack time (removes ~2 x 96 per-element stride-3 moves per tile-row).
+// ptrs[e] (int64) is the blob address of expert e: a device slot (cache arena), or USM host memory
+// (sycl::malloc_host / pinned torch tensor) which the kernels read zero-copy over PCIe. Nothing else changes.
+//
+// Per MoE layer:
+//   align    : one work-group; histogram of topk ids -> active-expert list, pairs sorted by expert, inverse map
+//   gateup   : WG per (active expert, 128-col block): gate & up trellis GEMV (split-K in the WG), SLM reduce,
+//              output Hadamards, SiLU(g)*u, down input Hadamard -> abuf[pair, I] (fp16, Hadamard domain)
+//   down     : WG per (active expert, 128-col block of H): trellis GEMV, SLM reduce, output Hadamard * svh * w
+//              -> y[pair, H] fp32
+//   combine  : out[m] = sum_k y[pair_of[m, k]]  (fixed order: deterministic)
+// Prefill (many rows per expert): same pipeline with DPAS (XMX) GEMMs over MB-row blocks (moe_*_dpas below).
+
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include "exl3_esimd.h"
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <atomic>
+#include <thread>
+#include <memory>
+// N128: Qwen3.8-Flash-Next swiglu_limit clamp (gate <= L, -L <= up <= L) before SiLU(g)*u, as exllamav3 act_limit /
+// sglang swiglu_clamped. Compile with -DEXL3_ACT_LIMIT=10.0f; 0 / undefined = no clamp (a9/n124 behaviour).
+#ifndef EXL3_ACT_LIMIT
+#define EXL3_ACT_LIMIT 0.0f
+#endif
+#define EXL3_ACT_CLAMP(g, u) do { if (EXL3_ACT_LIMIT > 0.0f) { \
+    g.merge(simd<float, 128>(EXL3_ACT_LIMIT), g > EXL3_ACT_LIMIT); \
+    u.merge(simd<float, 128>(EXL3_ACT_LIMIT), u > EXL3_ACT_LIMIT); \
+    u.merge(simd<float, 128>(-EXL3_ACT_LIMIT), u < -EXL3_ACT_LIMIT); } } while (0)
+
+
+using namespace exl3;
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+namespace moe {
+
+static sycl::queue& queue_of(const at::Tensor& t) {
+    return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+struct Geom {
+    int H, I, K;
+    int W() const { return 8 * K; }
+    size_t gu_bytes() const { return (size_t)(H / 16) * (2 * I / 16) * W() * 4; }
+    size_t d_bytes() const { return (size_t)(I / 16) * (H / 16) * W() * 4; }
+    size_t off_suh_g() const { return gu_bytes() + d_bytes(); }
+    size_t off_suh_u() const { return off_suh_g() + (size_t)H * 2; }
+    size_t off_svh_g() const { return off_suh_u() + (size_t)H * 2; }
+    size_t off_svh_u() const { return off_svh_g() + (size_t)I * 2; }
+    size_t off_suh_d() const { return off_svh_u() + (size_t)I * 2; }
+    size_t off_svh_d() const { return off_suh_d() + (size_t)I * 2; }
+    size_t blob() const { return off_svh_d() + (size_t)H * 2; }
+};
+
+struct Route {
+    const int* act_expert; const int* act_start; const int* act_cnt; const int* n_act;
+    const int* act_pstart;          // padded (to MB) row start per active expert (prefill)
+    const int* pair_tok; const float* pair_w;
+    // pair mode (small M, no align launch): work item a = pair m*topk + k, expert act_expert[a] = topk_ids (flat),
+    // one row each, pair_w = topk_w (flat). A duplicated expert is read once per pair (rare at M <= 4).
+    int pair_topk = 0;              // > 0: pair mode
+    int npairs = 0;
+    // device expert cache: fill[e] != 0 -> expert e is read from its (host) pointer and written through to the
+    // device slot at address fill[e] by the GEMV kernels (combine then repoints ptrs[e] to it)
+    const int64_t* fill = nullptr;
+    ESIMD_INLINE void get(int a, int& e, int& s0, int& cnt) const {
+        if (pair_topk) { e = act_expert[a]; s0 = a; cnt = 1; }
+        else { e = act_expert[a]; s0 = act_start[a]; cnt = act_cnt[a]; }
+    }
+    ESIMD_INLINE int nact() const { return pair_topk ? npairs : n_act[0]; }
+    ESIMD_INLINE int tok(int s) const { return pair_topk ? s / pair_topk : pair_tok[s]; }
+};
+
+// Prefetch n_rows tile-row strips (NW dwords each, row stride in dwords) into the cache hierarchy, no registers.
+// L1C: also allocate in L1 (else L2 only).
+#ifndef EXL3_MOE_PF
+#define EXL3_MOE_PF 0   // REJECTED on B70: 1 (L2) M=1 82 -> 128 us, 2 (L1+L2) -> 130 us
+#endif
+template <int NW, bool L1C>
+ESIMD_INLINE void pf_rows(const uint32_t* p, size_t stride, int n_rows) {
+    namespace xe = sycl::ext::intel::experimental::esimd;
+    constexpr auto h1 = L1C ? xe::cache_hint::cached : xe::cache_hint::uncached;
+    for (int r = 0; r < n_rows; ++r) {
+#pragma unroll
+        for (int c = 0; c < NW / 32; ++c)
+            xe::lsc_prefetch<uint32_t, 32, xe::lsc_data_size::default_size, h1, xe::cache_hint::cached>(p + r * stride + 32 * c);
+    }
+}
+
+// prev plane 0 of NT pre-planarized tiles = plane D-1 rotated by one period within each tile.
+template <int K, int NT>
+ESIMD_INLINE void planar_prev(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev);
+
+// Load one tile-row strip of NT pre-planarized tiles and derive prev.
+template <int K, int NT>
+ESIMD_INLINE void load_planar(const uint32_t* p, simd<uint32_t, NT * Geo<K>::WORDS>& words,
+                              simd<uint32_t, NT * Geo<K>::WORDS>& prev) {
+    words = block_load<uint32_t, NT * Geo<K>::WORDS>(p);
+    planar_prev<K, NT>(words, prev);
+}
+
+template <int K, int NT>
+ESIMD_INLINE void planar_prev(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev) {
+    constexpr int D = Geo<K>::D, G = Geo<K>::G, W = Geo<K>::WORDS;
+    if constexpr (D > 1) {
+        static_assert(NT * G == 32, "planar group = 32 lanes");
+        auto pm = prev.template bit_cast_view<uint32_t, NT * W / G, G>();      // rows of G lanes; row t = tile t of plane 0
+        auto wm = words.template bit_cast_view<uint32_t, NT * W / G, G>();
+        pm.template select<NT, 1, G - 1, 1>(0, 1) = wm.template select<NT, 1, G - 1, 1>((D - 1) * NT, 0);
+        pm.template select<NT, 1, 1, 1>(0, 0) = wm.template select<NT, 1, 1, 1>((D - 1) * NT, G - 1);
+    } else {
+        prev.template select<NT * W - 1, 1>(1) = words.template select<NT * W - 1, 1>(0);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) prev[j * W] = words[j * W + W - 1];
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// gate|up (+ SiLU + down input Hadamard). Threads: T = 4 * P  (proj x 2 strips of NT=4 tiles x P k-splits).
+template <int K, int MR, int P, typename TIn>
+struct GateUpKernel {
+    const TIn* x; int x_stride;
+    const int64_t* ptrs;
+    Route rt;
+    fp16* abuf;                     // [npairs, I]
+    int H, I;
+    size_t off_suh_g, off_svh_g, off_suh_d;
+    int tail_dw = 0;                // dwords from off_suh_g to the blob end (vector tail, write-through copy)
+
+    static constexpr int NT = 4;
+    static constexpr int W = Geo<K>::WORDS, D = Geo<K>::D;
+    using GK = GemvKernel<K, 2, MR, NT>;
+    static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
+    static constexpr int L = 32 / Geo<K>::V;
+    static constexpr int SLM = P * MR * 256 * 4;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM>();
+        int t = it.get_local_id(0);
+        int nbn = I / 128;
+        int wg = it.get_group(0);
+        int a = wg / nbn, nb = wg % nbn;
+        if (a >= rt.nact()) return;
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base);
+        int proj = t & 1, strip = (t >> 1) & 1, p = t >> 2;
+        int tiles_n = 2 * I / 16;
+        int tile_n0 = proj * (I / 16) + nb * 8 + strip * NT;
+        const fp16* suh = reinterpret_cast<const fp16*>(base + off_suh_g) + (size_t)proj * H;
+        int tk = H / 16, rps = tk / P, r0 = p * rps;
+        if constexpr (EXL3_MOE_PF) pf_rows<NT * W, EXL3_MOE_PF == 2>(tr + ((size_t)r0 * tiles_n + tile_n0) * W, (size_t)tiles_n * W, rps);
+        uint32_t* dst = rt.fill ? reinterpret_cast<uint32_t*>(rt.fill[e]) : nullptr;
+        if (dst && nb == 0 && t == 0) {
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(base + off_suh_g);
+            uint32_t* d2 = dst + off_suh_g / 4;
+            int i = 0;
+            for (; i + 64 <= tail_dw; i += 64) block_store<uint32_t, 64>(d2 + i, block_load<uint32_t, 64>(src + i));
+            for (; i < tail_dw; ++i) d2[i] = src[i];
+        }
+
+        for (int c0 = 0; c0 < cnt; c0 += MR) {
+            int tok[MR];
+#pragma unroll
+            for (int m = 0; m < MR; ++m) tok[m] = (c0 + m < cnt) ? rt.tok(s0 + c0 + m) : -1;
+            simd<float, ACC> acc = 0.0f;
+            for (int rb = r0; rb < r0 + rps; rb += 8) {
+                int kb = rb / 8;
+#ifdef EXL3_MOE_BATCHLOAD
+                // issue all 8 tile-rows' loads first (memory-level parallelism), then the input Hadamard
+                simd<uint32_t, 8 * NT * W> wb;
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    wb.template select<NT * W, 1>(i * NT * W) =
+                        block_load<uint32_t, NT * W>(tr + ((size_t)(rb + i) * tiles_n + tile_n0) * W);
+#endif
+                simd<fp16, MR * 128> xblk;
+                simd<float, 128> su = convert<float>(block_load<fp16, 128>(suh + kb * 128));
+#pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    if (tok[m] >= 0) {
+#ifdef EXL3_MOE_PROBE_NOHAD
+                        xblk.template select<128, 1>(m * 128) = convert<fp16>(block_load<TIn, 128>(x + (size_t)tok[m] * x_stride + kb * 128));
+                        continue;
+#endif
+                        simd<float, 128> v = convert<float>(block_load<TIn, 128>(x + (size_t)tok[m] * x_stride + kb * 128)) * su;
+                        v = convert<float>(convert<fp16>(v));
+                        fwht128(v);
+                        xblk.template select<128, 1>(m * 128) = convert<fp16>(v * kRsqrt128);
+                    } else {
+                        xblk.template select<128, 1>(m * 128) = 0;
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    simd<uint32_t, NT * W> words, prev;
+#ifdef EXL3_MOE_BATCHLOAD
+                    words = wb.template select<NT * W, 1>(i * NT * W);
+                    prev.template select<NT * W - 1, 1>(1) = words.template select<NT * W - 1, 1>(0);
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) prev[j * W] = words[j * W + W - 1];
+#else
+                    size_t t0 = (size_t)(rb + i) * tiles_n + tile_n0;
+                    load_planar<K, NT>(tr + t0 * W, words, prev);
+                    if (dst && c0 == 0) block_store<uint32_t, NT * W>(dst + t0 * W, words);
+#endif
+                    simd<fp16, MR * 16> xr;
+#pragma unroll
+                    for (int m = 0; m < MR; ++m) xr.template select<16, 1>(m * 16) = xblk.template select<16, 1>(m * 128 + i * 16);
+                    simd<fp16, ACC> hacc = 0;
+#ifdef EXL3_MOE_PROBE_LOADONLY
+                    acc.template select<32, 1>(0) += convert<float>(simd<uint32_t, 32>(words.template select<32, 1>(0)) ^ simd<uint32_t, 32>(prev.template select<32, 1>(32)));
+                    acc.template select<16, 1>(0) += convert<float>(simd<fp16, 16>(xr.template select<16, 1>(0)));
+#else
+                    GK::template step<0>(words, prev, xr, hacc, nullptr);
+                    acc += convert<float>(hacc);
+#endif
+                }
+            }
+            // lanes -> columns; SLM part[p][m][proj*128 + strip*64 + j*16 + c]
+#pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                simd<float, NT * 16> o;
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        int b = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
+                        simd<float, 8> s = acc.template select<8, L>(b);
+#pragma unroll
+                        for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
+                        o.template select<8, 1>(j * 16 + h * 8) = s;
+                    }
+                slm_block_store<float, NT * 16>(((p * MR + m) * 256 + proj * 128 + strip * 64) * 4, o);
+            }
+            barrier();
+            if (t < MR && tok[t] >= 0) {
+                int m = t;
+                simd<float, 128> g = 0.0f, u = 0.0f;
+                for (int pp = 0; pp < P; ++pp) {
+                    g += slm_block_load<float, 128>(((pp * MR + m) * 256) * 4);
+                    u += slm_block_load<float, 128>(((pp * MR + m) * 256 + 128) * 4);
+                }
+                fwht128(g); fwht128(u);
+                const fp16* svg = reinterpret_cast<const fp16*>(base + off_svh_g);
+                g = convert<float>(convert<fp16>(g * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + nb * 128))));
+                u = convert<float>(convert<fp16>(u * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + I + nb * 128))));
+                EXL3_ACT_CLAMP(g, u);
+                simd<float, 128> act = g / (1.0f + exp(-g)) * u;           // SiLU(g) * u
+                act = convert<float>(convert<fp16>(act));
+                const fp16* sud = reinterpret_cast<const fp16*>(base + off_suh_d);
+                act = convert<float>(convert<fp16>(act * convert<float>(block_load<fp16, 128>(sud + nb * 128))));
+                fwht128(act);
+                block_store<fp16, 128>(abuf + (size_t)(s0 + c0 + m) * I + nb * 128, convert<fp16>(act * kRsqrt128));
+            }
+            barrier();
+        }
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// down: T = 2 * P (2 strips of NT=4 tiles x P k-splits); WG per (active expert, 128-col block of H).
+template <int K, int MR, int P>
+struct DownKernel {
+    const fp16* abuf;
+    const int64_t* ptrs;
+    Route rt;
+    float* y;                       // [npairs, H]
+    int H, I;
+    size_t off_d, off_svh_d;
+
+    static constexpr int NT = 4;
+    static constexpr int W = Geo<K>::WORDS, D = Geo<K>::D;
+    using GK = GemvKernel<K, 2, MR, NT>;
+    static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
+    static constexpr int L = 32 / Geo<K>::V;
+    static constexpr int SLM = P * MR * 128 * 4;
+    static constexpr int RB = (40 / P) < 8 ? (40 / P) : 8;   // tile-rows per batched load (I/16 = 40 for I=640)
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM>();
+        int t = it.get_local_id(0);
+        int nbn = H / 128;
+        int wg = it.get_group(0);
+        int a = wg / nbn, nb = wg % nbn;
+        if (a >= rt.nact()) return;
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base + off_d);
+        int strip = t & 1, p = t >> 1;
+        int tiles_n = H / 16;
+        int tile_n0 = nb * 8 + strip * NT;
+        int tk = I / 16, rps = tk / P, r0 = p * rps;
+        if constexpr (EXL3_MOE_PF) pf_rows<NT * W, EXL3_MOE_PF == 2>(tr + ((size_t)r0 * tiles_n + tile_n0) * W, (size_t)tiles_n * W, rps);
+        uint32_t* dst = rt.fill ? reinterpret_cast<uint32_t*>(rt.fill[e]) : nullptr;
+        if (dst) dst += off_d / 4;
+
+        for (int c0 = 0; c0 < cnt; c0 += MR) {
+            bool valid[MR];
+#pragma unroll
+            for (int m = 0; m < MR; ++m) valid[m] = c0 + m < cnt;
+            simd<float, ACC> acc = 0.0f;
+            for (int rb = r0; rb < r0 + rps; rb += RB) {
+#ifdef EXL3_MOE_BATCHLOAD
+            simd<uint32_t, RB * NT * W> wb;
+#pragma unroll
+            for (int i = 0; i < RB; ++i)
+                wb.template select<NT * W, 1>(i * NT * W) = block_load<uint32_t, NT * W>(tr + ((size_t)(rb + i) * tiles_n + tile_n0) * W);
+#endif
+#pragma unroll
+            for (int i = 0; i < RB; ++i) {
+                int r = rb + i;
+                simd<uint32_t, NT * W> words, prev;
+#ifdef EXL3_MOE_BATCHLOAD
+                words = wb.template select<NT * W, 1>(i * NT * W);
+                prev.template select<NT * W - 1, 1>(1) = words.template select<NT * W - 1, 1>(0);
+#pragma unroll
+                for (int j = 0; j < NT; ++j) prev[j * W] = words[j * W + W - 1];
+#else
+                load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
+                if (dst && c0 == 0) block_store<uint32_t, NT * W>(dst + ((size_t)r * tiles_n + tile_n0) * W, words);
+#endif
+                simd<fp16, MR * 16> xr = 0;
+#pragma unroll
+                for (int m = 0; m < MR; ++m)
+                    if (valid[m]) xr.template select<16, 1>(m * 16) = block_load<fp16, 16>(abuf + (size_t)(s0 + c0 + m) * I + r * 16);
+                simd<fp16, ACC> hacc = 0;
+#ifdef EXL3_MOE_PROBE_LOADONLY
+                acc.template select<32, 1>(0) += convert<float>(simd<uint32_t, 32>(words.template select<32, 1>(0)) ^ simd<uint32_t, 32>(prev.template select<32, 1>(32)));
+                acc.template select<16, 1>(0) += convert<float>(simd<fp16, 16>(xr.template select<16, 1>(0)));
+#else
+                GK::template step<0>(words, prev, xr, hacc, nullptr);
+                acc += convert<float>(hacc);
+#endif
+            }
+            }
+#pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                simd<float, NT * 16> o;
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        int b = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
+                        simd<float, 8> s = acc.template select<8, L>(b);
+#pragma unroll
+                        for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
+                        o.template select<8, 1>(j * 16 + h * 8) = s;
+                    }
+                slm_block_store<float, NT * 16>(((p * MR + m) * 128 + strip * 64) * 4, o);
+            }
+            barrier();
+            if (t < MR && valid[t]) {
+                int m = t;
+                simd<float, 128> v = 0.0f;
+                for (int pp = 0; pp < P; ++pp) v += slm_block_load<float, 128>(((pp * MR + m) * 128) * 4);
+                fwht128(v);
+                const fp16* svd = reinterpret_cast<const fp16*>(base + off_svh_d);
+                float w = rt.pair_w[s0 + c0 + m];
+                block_store<float, 128>(y + (size_t)(s0 + c0 + m) * H + nb * 128,
+                                        v * (kRsqrt128 * w) * convert<float>(block_load<fp16, 128>(svd + nb * 128)));
+            }
+            barrier();
+        }
+    }
+};
+
+// out[m, nb*128 : +128] = sum_k y[pair_of[m*topk + k], ...]
+template <typename TOut, typename TY = float>
+struct CombineKernel {
+    const TY* y; const int* pair_of; TOut* out;
+    int M, H, topk, out_stride;
+    int64_t* commit_ptrs = nullptr; int64_t* commit_fill = nullptr; const int* fill_list = nullptr;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int id = it.get_global_id(0);
+        if (id == 0 && fill_list) {
+            // expert cache commit: the filled slots are complete (GEMV kernels ran before this one)
+            int nf = fill_list[0];
+            for (int i = 0; i < nf; ++i) {
+                int e = fill_list[1 + i];
+                commit_ptrs[e] = commit_fill[e];
+                commit_fill[e] = 0;
+            }
+        }
+        int nbn = H / 128;
+        int m = id / nbn, nb = id % nbn;
+        if (m >= M) return;
+        simd<float, 128> v = 0.0f;
+        for (int k = 0; k < topk; ++k)
+            v += convert<float>(block_load<TY, 128>(y + (size_t)(pair_of ? pair_of[m * topk + k] : m * topk + k) * H + nb * 128));
+        block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
+    }
+};
+
+
+// ------------------------------------------------------------------------------------------------
+// PREFILL (DPAS / XMX). Rows of each active expert are split in MB-row blocks (align pads each expert to MB).
+// Trellis decode: SIMD32 across one PLANAR4 group of 4 tiles (the GEMV state function), scattered straight into
+// four VNNI B operands (K=3: P=1, MS=4 geometry of DpasKernel::build). A operands: MB x 16 fp16 per tile-row.
+
+template <int K, int NT, int u>
+ESIMD_INLINE void build4(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev,
+                         simd<fp16, 256 * NT>& B) {
+    if constexpr (u < Geo<K>::V) {
+        static_assert(Geo<K>::V == 32 && NT * Geo<K>::G == 32, "build4: K with 32 values per period, 4-tile groups");
+        simd<fp16, 32> v = decode_cb_h<2, 32>(tile_states<K, u, NT, true>(words, prev));
+        constexpr int h = (u >> 2) & 1;
+        constexpr int R = 4 * ((u >> 1) & 1) + ((u >> 3) & 3);
+        constexpr int C0 = 16 * h + (u & 1);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            auto Bm = B.template select<256, 1>(256 * j).template bit_cast_view<fp16, 8, 32>();
+            Bm.template select<1, 1, 8, 2>(R, C0) = v.template select<8, 1>(8 * j);
+        }
+        build4<K, NT, u + 1>(words, prev, B);
+    }
+}
+
+// gate|up: WG per row block b; T = 2 * (I/16) / NT threads (I=640: 20), thread = (proj, 4-tile group).
+template <int K, int MB, typename TIn>
+struct GateUpDpasKernel {
+    const TIn* x; int x_stride;
+    const int64_t* ptrs;
+    Route rt;
+    const int* blk_a; const int* n_blk;
+    fp16* ablk;                     // [blocks][I/16][MB][16] (down A operand, Hadamard domain)
+    int H, I;
+    size_t off_suh_g, off_svh_g, off_suh_d;
+
+    static constexpr int NT = 4, W = Geo<K>::WORDS;
+    static constexpr int SLM_A = 2 * 2 * 8 * MB * 16 * 2;          // [buf][proj][8 tile-rows][MB][16] fp16
+    static constexpr int SLM_E = MB * 256 * 4;                       // [MB][g 128 | u 128] fp32
+    static ESIMD_INLINE int a_off(int buf, int pj, int i, int m) { return (((buf * 2 + pj) * 8 + i) * MB + m) * 16 * 2; }
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM_A + SLM_E>();
+        int t = it.get_local_id(0), T = it.get_local_range(0);
+        int b = it.get_group(0);
+        if (b >= n_blk[0]) return;
+        int a = blk_a[b];
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
+        int r0 = (b - rt.act_pstart[a] / MB) * MB;
+        int rows = cnt - r0; if (rows > MB) rows = MB;
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base);
+        const fp16* suh = reinterpret_cast<const fp16*>(base + off_suh_g);
+        int half = T / 2;
+        int proj = t / half, grp = t % half;
+        int tiles_n = 2 * I / 16;
+        int tile_n0 = proj * (I / 16) + grp * NT;
+
+        simd<float, NT * MB * 16> acc = 0.0f;      // [NT][MB][16]
+        int nkb = H / 128;
+#ifndef EXL3_MOE_NO_PF_REG
+        simd<uint32_t, NT * W> wnext = block_load<uint32_t, NT * W>(tr + (size_t)tile_n0 * W);   // software pipeline
+#endif
+        for (int kb = 0; kb < nkb; ++kb) {
+            int buf = kb & 1;
+            for (int w = t; w < 2 * MB; w += T) {
+                int pj = w / MB, m = w % MB;
+                simd<fp16, 128> vh = 0;
+                if (m < rows) {
+                    int tok = rt.tok(s0 + r0 + m);
+                    simd<float, 128> v = convert<float>(block_load<TIn, 128>(x + (size_t)tok * x_stride + kb * 128)) *
+                                         convert<float>(block_load<fp16, 128>(suh + (size_t)pj * H + kb * 128));
+                    v = convert<float>(convert<fp16>(v));
+#ifndef EXL3_MOE_PROBE_DPAS_NOHAD
+                    fwht128(v);
+#endif
+                    vh = convert<fp16>(v * kRsqrt128);
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) slm_block_store<fp16, 16>(a_off(buf, pj, i, m), vh.template select<16, 1>(i * 16));
+            }
+            barrier();
+#pragma unroll 1
+            for (int i = 0; i < 8; ++i) {
+                int r = kb * 8 + i;
+                simd<uint32_t, NT * W> words, prev;
+#ifndef EXL3_MOE_NO_PF_REG
+                words = wnext;
+                if (r + 1 < H / 16) wnext = block_load<uint32_t, NT * W>(tr + ((size_t)(r + 1) * tiles_n + tile_n0) * W);
+                planar_prev<K, NT>(words, prev);
+#else
+                load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
+#endif
+                simd<fp16, 256 * NT> B;
+#ifdef EXL3_MOE_PROBE_DPAS_NODECODE
+                B.template select<NT * W * 2, 1>(0) = words.template bit_cast_view<fp16>();
+#else
+                build4<K, NT, 0>(words, prev, B);
+#endif
+#pragma unroll
+                for (int rb = 0; rb < MB / 8; ++rb) {
+                    simd<fp16, 128> A = slm_block_load<fp16, 128>(a_off(buf, proj, i, rb * 8));
+#ifdef EXL3_MOE_PROBE_DPAS_NODPAS
+                    acc.template select<128, 1>(rb * 128) += convert<float>(A) + convert<float>(B.template select<128, 1>(rb * 128));
+                    continue;
+#endif
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        auto c = acc.template select<128, 1>((j * MB + rb * 8) * 16);
+                        c = xmx::dpas<8, 8, float, float, fp16, fp16>(simd<float, 128>(c), simd<fp16, 256>(B.template select<256, 1>(256 * j)), A);
+                    }
+                }
+            }
+        }
+        // epilogue, one 128-col block of g and u at a time (2 groups of 4 tiles per proj)
+        const fp16* svg = reinterpret_cast<const fp16*>(base + off_svh_g);
+        const fp16* sud = reinterpret_cast<const fp16*>(base + off_suh_d);
+        int tk_d = I / 16;
+        for (int nb = 0; nb < I / 128; ++nb) {
+            barrier();
+            if (grp / 2 == nb) {
+                int hf = grp % 2;
+#pragma unroll
+                for (int m = 0; m < MB; ++m) {
+                    simd<float, NT * 16> o;
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) o.template select<16, 1>(j * 16) = acc.template select<16, 1>((j * MB + m) * 16);
+                    slm_block_store<float, NT * 16>(SLM_A + (m * 256 + proj * 128 + hf * 64) * 4, o);
+                }
+            }
+            barrier();
+            for (int m = t; m < rows; m += T) {
+                simd<float, 128> g = slm_block_load<float, 128>(SLM_A + (m * 256) * 4);
+                simd<float, 128> u = slm_block_load<float, 128>(SLM_A + (m * 256 + 128) * 4);
+                fwht128(g); fwht128(u);
+                g = convert<float>(convert<fp16>(g * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + nb * 128))));
+                u = convert<float>(convert<fp16>(u * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + I + nb * 128))));
+                EXL3_ACT_CLAMP(g, u);
+                simd<float, 128> act = g / (1.0f + exp(-g)) * u;
+                act = convert<float>(convert<fp16>(act));
+                act = convert<float>(convert<fp16>(act * convert<float>(block_load<fp16, 128>(sud + nb * 128))));
+                fwht128(act);
+                simd<fp16, 128> ah = convert<fp16>(act * kRsqrt128);
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    block_store<fp16, 16>(ablk + (((size_t)b * tk_d + nb * 8 + i) * MB + m) * 16, ah.template select<16, 1>(i * 16));
+            }
+        }
+    }
+};
+
+// down: WG per (row block b, quarter q of H); T = (H/4/16)/NT threads (H=2560: 10).
+template <int K, int MB, typename TY>
+struct DownDpasKernel {
+    const fp16* ablk;
+    const int64_t* ptrs;
+    Route rt;
+    const int* blk_a; const int* n_blk;
+    TY* y;                          // [npairs, H] (sorted pair order), routing weight applied
+    int H, I;
+    size_t off_d, off_svh_d;
+
+    static constexpr int NT = 4, W = Geo<K>::WORDS;
+    static constexpr int NQ = 4;
+    static constexpr int SLM_E = MB * 128 * 4;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM_E>();
+        int t = it.get_local_id(0), T = it.get_local_range(0);
+        int wg = it.get_group(0);
+        int b = wg / NQ, qd = wg % NQ;
+        if (b >= n_blk[0]) return;
+        int a = blk_a[b];
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
+        int r0 = (b - rt.act_pstart[a] / MB) * MB;
+        int rows = cnt - r0; if (rows > MB) rows = MB;
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base + off_d);
+        int tiles_n = H / 16, tk = I / 16;
+        int qcols = H / NQ;
+        int tile_n0 = qd * (qcols / 16) + t * NT;
+
+        simd<float, NT * MB * 16> acc = 0.0f;
+#ifndef EXL3_MOE_NO_PF_REG
+        simd<uint32_t, NT * W> wnext = block_load<uint32_t, NT * W>(tr + (size_t)tile_n0 * W);
+        simd<fp16, MB * 16> anext = block_load<fp16, MB * 16>(ablk + ((size_t)b * tk) * MB * 16);
+#endif
+#pragma unroll 1
+        for (int r = 0; r < tk; ++r) {
+            simd<uint32_t, NT * W> words, prev;
+#ifndef EXL3_MOE_NO_PF_REG
+            words = wnext;
+            simd<fp16, MB * 16> Ab = anext;
+            if (r + 1 < tk) {
+                wnext = block_load<uint32_t, NT * W>(tr + ((size_t)(r + 1) * tiles_n + tile_n0) * W);
+                anext = block_load<fp16, MB * 16>(ablk + (((size_t)b * tk + r + 1) * MB) * 16);
+            }
+            planar_prev<K, NT>(words, prev);
+#else
+            load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
+            simd<fp16, MB * 16> Ab = block_load<fp16, MB * 16>(ablk + (((size_t)b * tk + r) * MB) * 16);
+#endif
+            simd<fp16, 256 * NT> B;
+            build4<K, NT, 0>(words, prev, B);
+#pragma unroll
+            for (int rb = 0; rb < MB / 8; ++rb) {
+                simd<fp16, 128> A = Ab.template select<128, 1>(rb * 128);
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    auto c = acc.template select<128, 1>((j * MB + rb * 8) * 16);
+                    c = xmx::dpas<8, 8, float, float, fp16, fp16>(simd<float, 128>(c), simd<fp16, 256>(B.template select<256, 1>(256 * j)), A);
+                }
+            }
+        }
+        const fp16* svd = reinterpret_cast<const fp16*>(base + off_svh_d);
+        for (int nbl = 0; nbl < qcols / 128; ++nbl) {
+            barrier();
+            if (t / 2 == nbl) {
+                int hf = t % 2;
+#pragma unroll
+                for (int m = 0; m < MB; ++m) {
+                    simd<float, NT * 16> o;
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) o.template select<16, 1>(j * 16) = acc.template select<16, 1>((j * MB + m) * 16);
+                    slm_block_store<float, NT * 16>((m * 128 + hf * 64) * 4, o);
+                }
+            }
+            barrier();
+            int nb = qd * (qcols / 128) + nbl;
+            for (int m = t; m < rows; m += T) {
+                simd<float, 128> v = slm_block_load<float, 128>(m * 128 * 4);
+                fwht128(v);
+                float w = rt.pair_w[s0 + r0 + m];
+                v = v * (kRsqrt128 * w) * convert<float>(block_load<fp16, 128>(svd + nb * 128));
+                block_store<TY, 128>(y + (size_t)(s0 + r0 + m) * H + nb * 128, convert<TY>(v));
+            }
+        }
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// Routing: one work-group of 1024 work-items (any number of pairs; loops with stride 1024).
+static void launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
+                         int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
+                         int* pair_tok, float* pair_w, int* pair_of, int* blk_a = nullptr, int* n_blk = nullptr) {
+    constexpr int WG = 1024;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> cnt(sycl::range<1>(E), h), start(sycl::range<1>(E), h), fill(sycl::range<1>(E), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            int l = it.get_local_id(0);
+            auto g = it.get_group();
+            for (int e = l; e < E; e += WG) { cnt[e] = 0; fill[e] = 0; }
+            sycl::group_barrier(g);
+            for (int i = l; i < npairs; i += WG) {
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>(cnt[ids[i]]).fetch_add(1);
+            }
+            sycl::group_barrier(g);
+            // E <= WG: one expert per work-item
+            int c = l < E ? cnt[l] : 0;
+            int st = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+            int act = c > 0 ? 1 : 0;
+            int ai = sycl::exclusive_scan_over_group(g, act, sycl::plus<int>());
+            int nact = sycl::reduce_over_group(g, act, sycl::plus<int>());
+            int pc = (c + pad - 1) / pad * pad;
+            int pst = sycl::exclusive_scan_over_group(g, pc, sycl::plus<int>());
+            if (l < E) {
+                start[l] = st;
+                if (act) { act_expert[ai] = l; act_start[ai] = st; act_cnt[ai] = c; act_pstart[ai] = pst; }
+                if (act && blk_a)
+                    for (int j = 0; j < pc / pad; ++j) blk_a[pst / pad + j] = ai;
+            }
+            int ptot = sycl::reduce_over_group(g, pc, sycl::plus<int>());
+            if (l == 0) { n_act[0] = nact; if (n_blk) n_blk[0] = ptot / pad; }
+            sycl::group_barrier(g);
+            for (int i = l; i < npairs; i += WG) {
+                int e = ids[i];
+                int pos = start[e] + sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                      sycl::access::address_space::local_space>(fill[e]).fetch_add(1);
+                pair_tok[pos] = i / topk; pair_w[pos] = w[i]; pair_of[i] = pos;
+            }
+        });
+    });
+}
+
+// B70 (planar4 + pair mode), us/layer device M=1 / M=4: gu,dn 10,5 66.0/205.5; 5,5 63.0/196.6; 5,10 60.6/200.3;
+// 10,10 66.1/209.1; 10,20 72.5/241.5 -> gu 5, dn 10 for M = 1 else 5 (g_dn_p = 0: auto)
+static int g_gu_p = 5, g_dn_p = 0;
+void moe_set_splits(int64_t gu_p, int64_t dn_p) { g_gu_p = (int)gu_p; g_dn_p = (int)dn_p; }
+
+template <int K, int MR, int P, typename TIn>
+static void launch_gateup(sycl::queue& q, const TIn* x, int x_stride, const int64_t* ptrs, Route rt, fp16* abuf,
+                          int H, int I, const Geom& gm, int max_act) {
+    GateUpKernel<K, MR, P, TIn> k{x, x_stride, ptrs, rt, abuf, H, I, gm.off_suh_g(), gm.off_svh_g(), gm.off_suh_d(),
+                                  (int)((gm.blob() - gm.off_suh_g()) / 4)};
+    int T = 4 * P;
+    size_t n = (size_t)max_act * (I / 128) * T;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+}
+
+template <int K, int MR, int P>
+static void launch_down(sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt, float* y, int H, int I,
+                        const Geom& gm, int max_act) {
+    constexpr int RB = DownKernel<K, MR, P>::RB;
+    TORCH_CHECK((I / 16) % P == 0 && ((I / 16) / P) % RB == 0, "moe down: I/16 split");
+    DownKernel<K, MR, P> k{abuf, ptrs, rt, y, H, I, gm.gu_bytes(), gm.off_svh_d()};
+    int T = 2 * P;
+    size_t n = (size_t)max_act * (H / 128) * T;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+}
+
+template <int K, typename TIn>
+static void gateup_dispatch(int MR, sycl::queue& q, const TIn* x, int xs, const int64_t* ptrs, Route rt, fp16* abuf,
+                            int H, int I, const Geom& gm, int max_act) {
+#define GU(MRV, PV) if (MR == MRV && g_gu_p == PV) return launch_gateup<K, MRV, PV, TIn>(q, x, xs, ptrs, rt, abuf, H, I, gm, max_act);
+    GU(1, 10) GU(2, 10) GU(4, 10) GU(8, 5)
+    GU(1, 5) GU(2, 5) GU(4, 5) GU(1, 20) GU(2, 20)
+    /* N124: power-of-two k-splits for H/16 not divisible by 5 (Qwen3.8-Flash-Next H=4096) */
+    GU(1, 4) GU(2, 4) GU(1, 8) GU(2, 8) GU(4, 8) GU(1, 16) GU(2, 16)
+#undef GU
+    TORCH_CHECK(false, "moe gateup: unsupported MR/P ", MR, "/", g_gu_p);
+}
+
+template <int K>
+static void down_dispatch(int MR, sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt, float* y, int H,
+                          int I, const Geom& gm, int max_act) {
+#define DN(MRV, PV) if (MR == MRV && g_dn_p == PV) return launch_down<K, MRV, PV>(q, abuf, ptrs, rt, y, H, I, gm, max_act);
+    DN(1, 5) DN(2, 5) DN(4, 5) DN(8, 5)
+    DN(1, 10) DN(2, 10) DN(4, 10) DN(1, 20) DN(2, 20) DN(1, 40)
+    /* N124: I/16 = 128 (Qwen3.8-Flash-Next I=2048) */
+    DN(1, 4) DN(2, 4) DN(4, 4) DN(1, 16) DN(2, 16) DN(4, 16)
+#undef DN
+    TORCH_CHECK(false, "moe down: unsupported MR/P ", MR, "/", g_dn_p);
+}
+
+static int g_mr_override = 0;
+static int g_debug_skip = 0;
+static int g_pair_max_m = 4;   // M <= this: pair mode (no align launch)
+void moe_set_pair_max_m(int64_t v) { g_pair_max_m = (int)v; }   // timing probes: bit0 gateup, bit1 down, bit2 combine, bit3 align
+void moe_set_debug(int64_t v) { g_debug_skip = (int)v; }
+void moe_set_mr(int64_t mr) { g_mr_override = (int)mr; }
+
+// Routing tensors bundled as one int32 buffer so a caller can keep it across layers / replay it.
+struct RouteBufs {
+    at::Tensor ib;   // int32
+    at::Tensor fb;   // float
+    Route rt; int* act_expert; int* act_start; int* act_cnt; int* n_act; int* act_pstart; int* pair_tok; int* pair_of;
+    float* pair_w;
+    int* blk_a = nullptr; int* n_blk = nullptr; int max_blk = 0;
+};
+
+static RouteBufs make_route(const at::Tensor& like, int npairs, int E, int mb = 0) {
+    RouteBufs r;
+    int A = std::min(npairs, E);
+    int mxb = mb ? (npairs + mb - 1) / mb + A : 0;   // sum_e ceil(c_e / MB) <= npairs / MB + active experts
+    r.ib = at::empty({4 * A + 1 + 2 * npairs + 16 + mxb + 1}, like.options().dtype(at::kInt));
+    r.fb = at::empty({npairs}, like.options().dtype(at::kFloat));
+    int* p = r.ib.data_ptr<int>();
+    r.act_expert = p; r.act_start = p + A; r.act_cnt = p + 2 * A; r.act_pstart = p + 3 * A; r.n_act = p + 4 * A;
+    r.pair_tok = p + 4 * A + 1; r.pair_of = r.pair_tok + npairs;
+    r.pair_w = r.fb.data_ptr<float>();
+    r.rt = Route{r.act_expert, r.act_start, r.act_cnt, r.n_act, r.act_pstart, r.pair_tok, r.pair_w};
+    if (mb) { r.blk_a = r.pair_of + npairs + 16; r.n_blk = r.blk_a + mxb; r.max_blk = mxb; }
+    return r;
+}
+
+// GEMV vs DPAS on B70 (us/layer, device): M=96 2323 vs 2977, 128 2669 vs 3253, 192 3195 (MR4) vs 3353, 256 3536 (MR8) vs
+// 3561, 384 4840 vs 3740, 1024 11338 vs 4474 -> DPAS from M=256 (it decodes each active expert once per 32-row block)
+static int g_prefill_min_m = 256;   // M >= this: DPAS prefill path
+// NVMe/RAM tier (N104): device int32 [1 + 2*E] victim list: [n, (old_key, slot) x n]. When set, ensure records every
+// slot it re-assigns and moe_forward_cached copies the victim's VRAM blob back to its host address (the RAM tier)
+// BEFORE the GEMV write-through fill overwrites the slot. nullptr = off (stock behaviour).
+static int* g_vict = nullptr;
+void moe_set_victims(at::Tensor v) { g_vict = v.numel() ? v.data_ptr<int>() : nullptr; }
+// a9 (N111): victim RING. When set (together with victims), ensure claims a ring slot per written-back victim and the
+// victim copy goes VRAM slot -> VRAM ring slot (D2D, microseconds) instead of to the host address; ram_res is NOT set.
+// The host drains the ring with copy-engine D2H on a side stream, flags the expert RAM-resident only after its event
+// completed, then frees the ring slot (key = -1, uploaded on the compute stream). Ring full -> the victim is DROPPED
+// (no write-back, as NOVICT; counted in meta[2]).
+// meta int32 [4 + 2K]: [0] next search position, [1] claim sequence (monotonic), [2] drops, [3] K,
+//                      key[K] (-1 free, else the victim key L*E+e awaiting write-back), seq[K] (claim sequence of key).
+// sel int32 [E]: ring slot per victim entry of the current call (-1 = no copy). buf: VRAM [K x blob].
+static int* g_vr_meta = nullptr; static int* g_vr_sel = nullptr; static int64_t g_vr_base = 0; static int g_vr_K = 0;
+void moe_set_victim_ring(at::Tensor meta, at::Tensor sel, at::Tensor buf) {
+    if (!meta.numel()) { g_vr_meta = nullptr; g_vr_sel = nullptr; g_vr_base = 0; g_vr_K = 0; return; }
+    TORCH_CHECK(meta.scalar_type() == at::kInt && sel.scalar_type() == at::kInt && meta.is_contiguous() && sel.is_contiguous());
+    int K = (int)((meta.numel() - 4) / 2);
+    TORCH_CHECK(K > 0 && meta.numel() == 4 + 2 * K && buf.numel() > 0, "victim ring: meta [4 + 2K], buf [K * blob]");
+    g_vr_meta = meta.data_ptr<int>(); g_vr_sel = sel.data_ptr<int>(); g_vr_base = (int64_t)buf.data_ptr(); g_vr_K = K;
+}
+// a3: residency mask + miss ring. ram_res uint8 [L*E] (1 = the expert's RAM-tier address is backed and valid),
+// miss ring int32 [1 + R] ([0] = monotonic count, keys at 1 + count % R), safe int32 [L] (an expert per layer that is
+// always RAM-resident). Before each cached call, picks whose expert is in neither VRAM nor RAM are logged and replaced
+// by (safe, weight 0) so no kernel ever touches a non-resident host address. Victims written back are marked resident.
+// a5: host stride override. 0 = stride is the blob size (stock). Tier mode uses 2 MiB so every expert's RAM-tier address
+// is exactly one huge page (punch / repopulate / GPU-SVM fault one THP per expert). Slots and copy sizes stay = blob.
+static int64_t g_host_stride = 0;
+void moe_set_host_stride(int64_t s) { g_host_stride = s; }
+// a8: ask the driver to map (and fault in on the GPU side) a host range ahead of use: SVM first touch of a freshly filled
+// RAM-tier page costs ~5-8 ms per 2 MiB page when a kernel takes the fault itself. ptrs: int64 CPU [n], same size each.
+void moe_svm_prefetch(at::Tensor ptrs, int64_t nbytes, at::Tensor like) {
+    auto& q = queue_of(like);
+    auto p = ptrs.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < ptrs.numel(); ++i) q.prefetch(reinterpret_cast<void*>(p[i]), (size_t)nbytes);
+}
+static uint8_t* g_ram_res = nullptr; static int* g_miss = nullptr; static int g_miss_cap = 0; static const int* g_safe = nullptr;
+void moe_set_tier(at::Tensor ram_res, at::Tensor miss, at::Tensor safe) {
+    if (!ram_res.numel()) { g_ram_res = nullptr; g_miss = nullptr; g_miss_cap = 0; g_safe = nullptr; return; }
+    TORCH_CHECK(ram_res.scalar_type() == at::kByte && miss.scalar_type() == at::kInt && safe.scalar_type() == at::kInt);
+    g_ram_res = ram_res.data_ptr<uint8_t>(); g_miss = miss.data_ptr<int>(); g_miss_cap = (int)miss.numel() - 1;
+    g_safe = safe.data_ptr<int>();
+}
+void moe_set_prefill_min_m(int64_t v) { g_prefill_min_m = (int)v; }
+constexpr int kPrefillMB = 32;
+
+static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, const at::Tensor& topk_w,
+                              const at::Tensor& ptrs, const Geom& gm, int E, at::Tensor& out) {
+    auto& q = queue_of(x);
+    int M = x.size(0), H = gm.H, I = gm.I, topk = topk_ids.size(1), npairs = M * topk;
+    constexpr int MB = kPrefillMB;
+    TORCH_CHECK(gm.K == 3 && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
+    auto rb = make_route(x, npairs, E, MB);
+    launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, MB, rb.act_expert,
+                 rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of, rb.blk_a, rb.n_blk);
+    auto ablk = at::empty({(int64_t)rb.max_blk * (I / 16) * MB * 16}, x.options().dtype(at::kHalf));
+    auto y = at::empty({npairs, H}, x.options().dtype(at::kHalf));
+    const int64_t* pp = ptrs.data_ptr<int64_t>();
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    int T1 = 2 * (I / 16) / 4;
+    auto run_gu = [&](auto tag) {
+        using TIn = decltype(tag);
+        GateUpDpasKernel<3, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
+                                       rb.n_blk, reinterpret_cast<fp16*>(ablk.data_ptr()), H, I, gm.off_suh_g(),
+                                       gm.off_svh_g(), gm.off_suh_d()};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * T1, T1), props, k); });
+    };
+    if (!(g_debug_skip & 1)) { if (x.scalar_type() == at::kHalf) run_gu(fp16{}); else run_gu(bf16{}); }
+    int T2 = (H / 4 / 16) / 4;
+    DownDpasKernel<3, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
+                                   reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
+    if (!(g_debug_skip & 2))
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * 4 * T2, T2), props, kd); });
+    int n = M * (H / 128), local = 8;
+    auto run_c = [&](auto tag) {
+        using TO = decltype(tag);
+        CombineKernel<TO, fp16> ck{reinterpret_cast<const fp16*>(y.data_ptr()), rb.pair_of, reinterpret_cast<TO*>(out.data_ptr()),
+                                   M, H, topk, (int)out.stride(0)};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((n + local - 1) / local * local, local), ck); });
+    };
+    if (!(g_debug_skip & 4)) { if (x.scalar_type() == at::kHalf) run_c(fp16{}); else run_c(bf16{}); }
+    return out;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Device-managed expert cache (FreeToken-style, graph-safe, no host involvement):
+//   ptrs_all[L*E] (per-layer tables), slot_of[L*E] (-1 = host only), slot_key[S] (L*E+e or -1), slot_last[S] (LRU tick,
+//   -1 = empty), tick[1]. ensure(layer, ids): touch hit slots; for each miss (<= max_fill) take the LRU slot not
+//   touched this tick, repoint its old owner to host, assign it, and request a write-through fill (fill_all[key] =
+//   slot address, fill_list = [n, e...]). The GEMV kernels read the miss from host and write it into the slot;
+//   the combine kernel commits ptrs[e] = slot. One work-group of 1024.
+static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer, int E, int S, int64_t* ptrs_all,
+                          int* slot_of, int* slot_key, int* slot_last, int* tick, const int64_t* host_base,
+                          int64_t slot_base, int64_t blob, int64_t* fill_all, int* fill_list, int max_fill,
+                          int* pf_slot = nullptr, int* host_plan = nullptr, int* plan_seq = nullptr,
+                          int* pend = nullptr, const int* done_seq = nullptr, int n_layers = 0,
+                          int* mask_ids = nullptr, float* mask_w = nullptr) {
+    // pend (device, per layer li: [n, seq, T, e[16], s[16]] = 35 ints) + done_seq[li] (written ONLY by the copy
+    // engine after a plan's data): every ensure/plan call first commits finished plans on the device (ptrs -> slot,
+    // unpin). The copy engine never writes metadata the device writes (no shared cache lines between agents).
+    // host_plan != nullptr (with pf_slot): copy-engine prefetch plan. Planned slots are PINNED (slot_last = INT_MAX:
+    // never a victim, hits do not re-stamp them) and (e, s) pairs are written to USM host memory for the host worker
+    // (moe_prefetch_worker_*), which copies the blobs on the copy engine and then commits ptrs / slot_last with
+    // ordered 8- / 4-byte copies. Layout (int32): [seq, n, T, layer, e[E], s[E]]; seq published last (system scope).
+    // pf_slot != nullptr: PREFETCH mode (side queue, between two MoE calls): the tick is not advanced, so slots
+    // touched by the last MoE call (last == T) stay protected; hits are re-stamped T; misses get LRU slots with
+    // last < T, recorded as fill_list = [n, e...], pf_slot = [s...] for the gather-copy + commit kernels (no
+    // write-through fills, fill_all untouched).
+    const bool prefetch = pf_slot != nullptr;
+    int* vict_out = (prefetch || host_plan) ? nullptr : g_vict;
+    const int64_t hstride = g_host_stride ? g_host_stride : blob;
+    const uint8_t* m_rr = (mask_ids && mask_w) ? g_ram_res : nullptr;
+    int* m_ring = g_miss; const int m_cap = g_miss_cap; const int* m_safe = g_safe;
+    const uint8_t* v_rr = vict_out ? g_ram_res : nullptr;   // a7: skip write-back of victims whose RAM copy is resident
+    int* vr_meta = vict_out ? g_vr_meta : nullptr; int* vr_sel = g_vr_sel; const int vr_K = g_vr_K;   // a9 victim ring
+    constexpr int WG = 1024;
+    // Victim selection = exact LRU by radix select over u = slot_last + 1 (empty slots u = 0, slots touched this tick
+    // excluded): four 8-bit histogram passes find the nm-th smallest u (tau, ties needed), one compaction pass takes
+    // every slot with u < tau and `need` slots with u == tau. v1 did one argmin pass per miss (~100 us per miss at S=12k).
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> need(sycl::range<1>(E), h), miss(sycl::range<1>(E), h), vict(sycl::range<1>(E), h);
+        sycl::local_accessor<int, 1> hist(sycl::range<1>(256), h), sc(sycl::range<1>(8), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            int l = it.get_local_id(0);
+            auto g = it.get_group();
+            using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                          sycl::access::address_space::local_space>;
+            if (l == 0) { sc[0] = prefetch ? tick[0] : ++tick[0]; sc[1] = 0; sc[2] = 0; sc[3] = 0; }
+            for (int e = l; e < E; e += WG) need[e] = 0;
+            if (pend) {
+                // commit finished copy-engine prefetches: decide once per layer (vict[] as flags), then commit, then reset
+                constexpr int PS = 35;
+                for (int li = l; li < n_layers; li += WG) {
+                    int* pl = pend + li * PS;
+                    int dn = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                              sycl::access::address_space::global_space>(*const_cast<int*>(done_seq + li)).load();
+                    vict[li] = (pl[0] > 0 && dn >= pl[1]) ? 1 : 0;
+                }
+                sycl::group_barrier(g);
+                for (int w = l; w < n_layers * 16; w += WG) {
+                    int li = w / 16, i = w % 16;
+                    int* pl = pend + li * PS;
+                    if (vict[li] && i < pl[0]) {
+                        int e = pl[3 + i], s = pl[3 + 16 + i];
+                        ptrs_all[li * E + e] = slot_base + (int64_t)s * blob;
+                        slot_last[s] = pl[2];
+                    }
+                }
+                sycl::group_barrier(g);
+                for (int li = l; li < n_layers; li += WG)
+                    if (vict[li]) pend[li * PS] = 0;
+            }
+            sycl::group_barrier(g);
+            if (host_plan && pend[layer * 35] > 0) {      // previous plan of this layer still in flight: skip
+                if (l == 0) fill_list[0] = 0;
+                return;
+            }
+            if (m_rr) {
+                // a6: picks whose expert is in neither VRAM nor RAM -> (safe expert, weight 0), key logged to the ring
+                for (int i = l; i < npairs; i += WG) {
+                    int key = layer * E + mask_ids[i];
+                    if (slot_of[key] < 0 && !m_rr[key]) {
+                        int c = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space>(m_ring[0]).fetch_add(1);
+                        m_ring[1 + c % m_cap] = key;
+                        mask_ids[i] = m_safe[layer]; mask_w[i] = 0.0f;
+                    }
+                }
+                sycl::group_barrier(g);
+            }
+            for (int i = l; i < npairs; i += WG) need[ids[i]] = 1;
+            sycl::group_barrier(g);
+            const int T = sc[0];
+            for (int e = l; e < E; e += WG) {
+                if (!need[e]) continue;
+                int s = slot_of[layer * E + e];
+                if (s >= 0) { if (slot_last[s] != 0x7FFFFFFF) slot_last[s] = T; }   // pinned: copy in flight
+                else miss[lref(sc[1]).fetch_add(1)] = e;
+            }
+            sycl::group_barrier(g);
+            int nm = S > 0 ? sycl::min(sc[1], max_fill) : 0;
+            if (nm == 0) { if (l == 0) { fill_list[0] = 0; if (vict_out) vict_out[0] = 0; } return; }
+            // eligible = not touched this tick. Each work-item owns a contiguous chunk of slots (slots filled together
+            // share ticks), and aggregates runs of equal bins locally: one SLM atomic per run, not per slot.
+            const int C = (S + WG - 1) / WG, s0 = l * C, s1 = sycl::min(S, s0 + C);
+            int elig = 0, empty = 0;
+            uint32_t umin = 0xFFFFFFFFu, umax = 0;
+            for (int s = s0; s < s1; ++s) {
+                int la = slot_last[s];
+                if (la >= T) continue;
+                uint32_t u = (uint32_t)(la + 1);
+                ++elig; empty += la == -1;
+                umin = sycl::min(umin, u); umax = sycl::max(umax, u);
+            }
+            elig = sycl::reduce_over_group(g, elig, sycl::plus<int>());
+            empty = sycl::reduce_over_group(g, empty, sycl::plus<int>());
+            umin = sycl::reduce_over_group(g, umin, sycl::minimum<uint32_t>());
+            umax = sycl::reduce_over_group(g, umax, sycl::maximum<uint32_t>());
+            nm = sycl::min(nm, elig);
+            if (nm == 0) { if (l == 0) { fill_list[0] = 0; if (vict_out) vict_out[0] = 0; } return; }
+            // start at the highest byte where the eligible keys differ; the bytes above are the common prefix
+            int top = 24;
+            while (top > 0 && ((umin ^ umax) >> top) == 0) top -= 8;
+            uint32_t prefix = top == 24 ? 0u : (umin & (0xFFFFFFFFu << (top + 8)));
+            int want = nm;
+            // warm-up fast path: enough empty slots (u = 0) -> tau = 0, no radix passes
+            if (empty >= nm) { prefix = 0; top = -8; }
+            for (int shift = top; shift >= 0; shift -= 8) {
+                if (l < 256) hist[l] = 0;
+                sycl::group_barrier(g);
+                uint32_t hmask = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+                int run_bin = -1, run_n = 0;
+                for (int s = s0; s < s1; ++s) {
+                    int la = slot_last[s];
+                    if (la >= T) continue;
+                    uint32_t u = (uint32_t)(la + 1);
+                    if ((u & hmask) != (prefix & hmask)) continue;
+                    int b = (u >> shift) & 255;
+                    if (b != run_bin) {
+                        if (run_n) lref(hist[run_bin]).fetch_add(run_n);
+                        run_bin = b; run_n = 0;
+                    }
+                    ++run_n;
+                }
+                if (run_n) lref(hist[run_bin]).fetch_add(run_n);
+                sycl::group_barrier(g);
+                int c = l < 256 ? hist[l] : 0;
+                int cum = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+                if (l < 256 && cum < want && want <= cum + c) { sc[4] = l; sc[5] = want - cum; }
+                sycl::group_barrier(g);
+                prefix |= (uint32_t)sc[4] << shift;
+                want = sc[5];
+                sycl::group_barrier(g);
+            }
+            // compaction: all u < tau, then `want` slots with u == tau (ranges reserved with one atomic per item)
+            int n_lt = 0, n_eq = 0;
+            for (int s = s0; s < s1; ++s) {
+                int la = slot_last[s];
+                if (la >= T) continue;
+                uint32_t u = (uint32_t)(la + 1);
+                n_lt += u < prefix;
+                n_eq += u == prefix;
+            }
+            int base_lt = n_lt ? lref(sc[2]).fetch_add(n_lt) : 0;
+            int base_eq = n_eq ? lref(sc[3]).fetch_add(n_eq) : 0;
+            int take_eq = sycl::max(0, sycl::min(n_eq, want - base_eq));
+            sycl::group_barrier(g);
+            const int total_lt = sc[2];                 // == nm - want
+            int ilt = base_lt, ieq = 0;
+            for (int s = s0; s < s1; ++s) {
+                int la = slot_last[s];
+                if (la >= T) continue;
+                uint32_t u = (uint32_t)(la + 1);
+                if (u < prefix) vict[ilt++] = s;
+                else if (u == prefix && ieq < take_eq) vict[total_lt + base_eq + ieq++] = s;
+            }
+            sycl::group_barrier(g);
+            // assign (distinct slots, distinct experts: no conflicts)
+            for (int mi = l; mi < nm; mi += WG) {
+                int s = vict[mi], e = miss[mi];
+                int old = slot_key[s];
+                // a7: weights are immutable - a victim still resident in RAM needs no write-back (decided here, once,
+                // before the copy kernel, so the copy's work-groups never race on the flag)
+                if (vict_out) { vict_out[1 + 2 * mi] = (old >= 0 && v_rr && v_rr[old]) ? -1 : old; vict_out[2 + 2 * mi] = s; }
+                if (old >= 0) {
+                    slot_of[old] = -1;
+                    ptrs_all[old] = host_base[old / E] + (int64_t)(old % E) * hstride;
+                }
+                int key = layer * E + e;
+                slot_key[s] = key; slot_of[key] = s;
+                slot_last[s] = host_plan ? 0x7FFFFFFF : T;
+                if (prefetch) pf_slot[mi] = s;
+                else fill_all[key] = slot_base + (int64_t)s * blob;
+                fill_list[1 + mi] = e;
+                if (host_plan) {
+                    host_plan[4 + mi] = e; host_plan[4 + E + mi] = s;
+                    pend[layer * 35 + 3 + mi] = e; pend[layer * 35 + 3 + 16 + mi] = s;
+                }
+            }
+            if (host_plan) sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::group_barrier(g);
+            if (l == 0) {
+                fill_list[0] = nm;
+                if (vict_out) vict_out[0] = nm;
+                if (vr_meta) {
+                    // a9: claim ring slots serially (one work-item; nm and K are small). A slot is free only after the
+                    // host saw its D2H complete and wrote key = -1 between graph replays (same in-order queue).
+                    int* vk = vr_meta + 4; int* vs = vr_meta + 4 + vr_K;
+                    int p = vr_meta[0];
+                    for (int mi = 0; mi < nm; ++mi) {
+                        int old = vict_out[1 + 2 * mi], r = -1;
+                        if (old >= 0) {
+                            for (int j = 0; j < vr_K; ++j) {
+                                int qq = p + j; if (qq >= vr_K) qq -= vr_K;
+                                if (vk[qq] < 0) { r = qq; break; }
+                            }
+                            if (r >= 0) { vk[r] = old; vs[r] = ++vr_meta[1]; p = r + 1 == vr_K ? 0 : r + 1; }
+                            else vr_meta[2] += 1;
+                        }
+                        vr_sel[mi] = r;
+                    }
+                    vr_meta[0] = p;
+                }
+                if (host_plan) {
+                    host_plan[1] = nm; host_plan[2] = T; host_plan[3] = layer;
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    int sq = ++plan_seq[layer];
+                    if (nm > 0) { pend[layer * 35 + 1] = sq; pend[layer * 35 + 2] = T; pend[layer * 35] = nm; }
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                     sycl::access::address_space::global_space>(host_plan[0]).store(sq);
+                }
+            }
+        });
+    });
+}
+
+static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, const int64_t* pp_override,
+                                   at::Tensor ptrs, int64_t I, int64_t K, int64_t n_experts, const int64_t* fill,
+                                   int64_t* commit_ptrs, int64_t* commit_fill, const int* fill_list);
+
+// ------------------------------------------------------------------------------------------------
+// Copy-engine prefetch: plan kernel (compute stream) + host worker thread (no GIL, own in-order queue).
+struct PfWorker {
+    sycl::queue q;
+    std::thread th;
+    std::atomic<bool> stop{false};
+    int* plans = nullptr;            // host USM, L x (4 + 2E) int32
+    int L = 0, E = 0;
+    std::vector<int64_t> host_base;
+    int64_t slot_base = 0, blob = 0;
+    int64_t* ptrs_all = nullptr; int* slot_last = nullptr; int* done_seq = nullptr;
+    int64_t* cv = nullptr; int* lv = nullptr;   // host USM commit values [L][2][E]
+    std::vector<int> last_seq;
+    std::atomic<int64_t> n_plans{0}, n_copies{0};
+    void run() {
+        const int stride = 4 + 2 * E;
+        while (!stop.load(std::memory_order_relaxed)) {
+            bool any = false;
+            for (int li = 0; li < L; ++li) {
+                int* pl = plans + (size_t)li * stride;
+                int seq = __atomic_load_n(pl, __ATOMIC_ACQUIRE);
+                if (seq == last_seq[li]) continue;
+                any = true;
+                int n = __atomic_load_n(pl + 1, __ATOMIC_ACQUIRE), T = pl[2];
+                int par = seq & 1;
+                int64_t* c = cv + ((size_t)li * 2 + par) * E;
+                int* lvv = lv + ((size_t)li * 2 + par) * E;
+                for (int i = 0; i < n; ++i) {
+                    int e = pl[4 + i], s = pl[4 + E + i];
+                    q.memcpy(reinterpret_cast<void*>(slot_base + (int64_t)s * blob),
+                             reinterpret_cast<const void*>(host_base[li] + (int64_t)e * blob), (size_t)blob);
+                }
+                (void)T; (void)c;
+                lvv[0] = seq;                                   // stable host source for the done flag
+                q.memcpy(done_seq + li, lvv, 4);                // device commits when it sees done_seq >= seq
+                last_seq[li] = seq;
+                n_plans++;
+                n_copies += n;
+            }
+            if (!any) std::this_thread::yield();
+        }
+        q.wait();
+    }
+};
+static std::unique_ptr<PfWorker> g_pfw;
+
+void moe_prefetch_worker_start(at::Tensor plans, at::Tensor host_base_cpu, int64_t slot_base, int64_t blob,
+                               at::Tensor ptrs_all, at::Tensor slot_last, at::Tensor commit_host, at::Tensor done_seq,
+                               int64_t n_layers, int64_t n_experts) {
+    TORCH_CHECK(!g_pfw, "prefetch worker already running");
+    // the CURRENT torch XPU stream's queue (caller: `with torch.xpu.stream(dedicated_stream)`): a queue built here
+    // with sycl::queue(ctx, dev, in_order) did not overlap its memcpys with compute on B70 (X006b v1: no gain even
+    // with 870 us/layer of compute); memcpy on a torch side stream overlaps fully (X002d).
+    auto w = std::make_unique<PfWorker>();
+    w->q = c10::xpu::getCurrentXPUStream().queue();
+    w->plans = reinterpret_cast<int*>(plans.data_ptr());
+    w->L = (int)n_layers; w->E = (int)n_experts;
+    w->host_base.assign(host_base_cpu.data_ptr<int64_t>(), host_base_cpu.data_ptr<int64_t>() + n_layers);
+    w->slot_base = slot_base; w->blob = blob;
+    w->ptrs_all = ptrs_all.data_ptr<int64_t>(); w->slot_last = slot_last.data_ptr<int>();
+    w->done_seq = done_seq.data_ptr<int>();
+    uint8_t* ch = reinterpret_cast<uint8_t*>(commit_host.data_ptr());
+    w->cv = reinterpret_cast<int64_t*>(ch);
+    w->lv = reinterpret_cast<int*>(ch + (size_t)n_layers * 2 * n_experts * 8);
+    w->last_seq.assign(n_layers, 0);
+    for (int li = 0; li < n_layers; ++li) w->last_seq[li] = w->plans[(size_t)li * (4 + 2 * n_experts)];
+    PfWorker* raw = w.get();
+    w->th = std::thread([raw] { raw->run(); });
+    g_pfw = std::move(w);
+}
+
+std::vector<int64_t> moe_prefetch_worker_stop() {
+    if (!g_pfw) return {0, 0};
+    g_pfw->stop = true;
+    g_pfw->th.join();
+    std::vector<int64_t> r{g_pfw->n_plans.load(), g_pfw->n_copies.load()};
+    g_pfw.reset();
+    return r;
+}
+
+// Plan kernel (compute stream): claim + pin slots for predicted experts, publish the plan to the host worker.
+void moe_prefetch_plan(at::Tensor ids, at::Tensor ptrs_all, int64_t layer, at::Tensor slot_of, at::Tensor slot_key,
+                       at::Tensor slot_last, at::Tensor tick, at::Tensor host_base, int64_t slot_base, at::Tensor pf_list,
+                       at::Tensor pf_slot, at::Tensor plans, at::Tensor plan_seq, at::Tensor pend, at::Tensor done_seq,
+                       int64_t max_fill, int64_t n_experts, int64_t blob) {
+    TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous());
+    int E = (int)n_experts, S = (int)slot_key.numel();
+    if (S == 0 || ids.numel() == 0) return;
+    auto& q = queue_of(ids);
+    int mf = (int)std::min<int64_t>(std::min<int64_t>(max_fill, 16), pf_slot.numel());
+    int* plan = reinterpret_cast<int*>(plans.data_ptr()) + (size_t)layer * (4 + 2 * E);
+    launch_ensure(q, ids.data_ptr<int>(), (int)ids.numel(), (int)layer, E, S, ptrs_all.data_ptr<int64_t>(),
+                  slot_of.data_ptr<int>(), slot_key.data_ptr<int>(), slot_last.data_ptr<int>(), tick.data_ptr<int>(),
+                  host_base.data_ptr<int64_t>(), slot_base, blob, nullptr, pf_list.data_ptr<int>(), mf,
+                  pf_slot.data_ptr<int>(), plan, plan_seq.data_ptr<int>(), pend.data_ptr<int>(), done_seq.data_ptr<int>(),
+                  (int)done_seq.numel());
+}
+
+
+// Prefetch gather copy: WG per (prefetch entry i, 64 KiB chunk), 16 threads x 4 KiB, host USM -> device slot.
+struct PrefetchCopyKernel {
+    const int* pf_list; const int* pf_slot; const int64_t* host_base; int64_t slot_base; int64_t blob; int layer, E;
+    int chunks;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int wg = it.get_group(0), t = it.get_local_id(0);
+        int i = wg / chunks, c = wg % chunks;
+        if (i >= pf_list[0]) return;
+        int e = pf_list[1 + i], s = pf_slot[i];
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(host_base[layer] + (int64_t)e * blob);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(slot_base + (int64_t)s * blob);
+        int64_t nd = blob / 4;
+        int64_t d0 = (int64_t)c * 16384 + (int64_t)t * 1024;    // dwords
+#pragma unroll 4
+        for (int k = 0; k < 16; ++k) {
+            int64_t o = d0 + k * 64;
+            if (o + 64 <= nd) block_store<uint32_t, 64>(dst + o, block_load<uint32_t, 64>(src + o));
+            else for (int64_t q = o; q < nd && q < o + 64; ++q) dst[q] = src[q];
+        }
+    }
+};
+
+// Victim write-back (N104): WG per (victim i, 64 KiB chunk), 16 threads x 4 KiB, device slot -> host (RAM tier).
+struct VictimCopyKernel {
+    const int* vict; const int64_t* host_base; int64_t slot_base; int64_t blob; int E; int chunks; int64_t hstride;
+    uint8_t* ram_res;   // a6: mark the victim RAM-resident (later kernels on the in-order queue see it after this one)
+    const int* vr_sel = nullptr; int64_t vr_base = 0;   // a9: ring mode - copy into ring slot vr_sel[i], no ram_res
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int wg = it.get_group(0), t = it.get_local_id(0);
+        int i = wg / chunks, c = wg % chunks;
+        if (i >= vict[0]) return;
+        int old = vict[1 + 2 * i], s = vict[2 + 2 * i];
+        if (old < 0) return;
+        uint32_t* dst;
+        if (vr_sel) {
+            int r = vr_sel[i];
+            if (r < 0) return;                                  // ring full: dropped
+            dst = reinterpret_cast<uint32_t*>(vr_base + (int64_t)r * blob);
+        } else {
+            if (ram_res && c == 0 && t == 0) ram_res[old] = 1;
+            dst = reinterpret_cast<uint32_t*>(host_base[old / E] + (int64_t)(old % E) * hstride);
+        }
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(slot_base + (int64_t)s * blob);
+        int64_t nd = blob / 4;
+        int64_t d0 = (int64_t)c * 16384 + (int64_t)t * 1024;
+#pragma unroll 4
+        for (int k = 0; k < 16; ++k) {
+            int64_t o = d0 + k * 64;
+            if (o + 64 <= nd) block_store<uint32_t, 64>(dst + o, block_load<uint32_t, 64>(src + o));
+            else for (int64_t q = o; q < nd && q < o + 64; ++q) dst[q] = src[q];
+        }
+    }
+};
+
+// Prefetch: claim slots for predicted experts of `layer` (see launch_ensure prefetch mode), copy them from host,
+// then repoint the table. Enqueue on a SIDE stream that waited for the previous MoE call; make the compute stream
+// wait for this stream before the next MoE call of any layer.
+void moe_prefetch(at::Tensor ids, at::Tensor ptrs_all, int64_t layer, at::Tensor slot_of, at::Tensor slot_key,
+                  at::Tensor slot_last, at::Tensor tick, at::Tensor host_base, int64_t slot_base, at::Tensor pf_list,
+                  at::Tensor pf_slot, int64_t max_fill, int64_t n_experts, int64_t blob) {
+    TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous());
+    int E = (int)n_experts, S = (int)slot_key.numel();
+    if (S == 0 || ids.numel() == 0) return;
+    auto& q = queue_of(ids);
+    int mf = (int)std::min<int64_t>(max_fill, pf_slot.numel());
+    int64_t* pa = ptrs_all.data_ptr<int64_t>();
+    launch_ensure(q, ids.data_ptr<int>(), (int)ids.numel(), (int)layer, E, S, pa, slot_of.data_ptr<int>(),
+                  slot_key.data_ptr<int>(), slot_last.data_ptr<int>(), tick.data_ptr<int>(),
+                  host_base.data_ptr<int64_t>(), slot_base, blob, nullptr, pf_list.data_ptr<int>(), mf,
+                  pf_slot.data_ptr<int>());
+    int chunks = (int)((blob / 4 + 16383) / 16384);
+    PrefetchCopyKernel ck{pf_list.data_ptr<int>(), pf_slot.data_ptr<int>(), host_base.data_ptr<int64_t>(), slot_base,
+                          blob, (int)layer, E, chunks};
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)mf * chunks * 16, 16), ck); });
+    const int* pl = pf_list.data_ptr<int>();
+    const int* ps = pf_slot.data_ptr<int>();
+    int L = (int)layer;
+    q.submit([&](sycl::handler& h) {
+        h.single_task([=]() {
+            for (int i = 0; i < pl[0]; ++i) pa[L * E + pl[1 + i]] = slot_base + (int64_t)ps[i] * blob;
+        });
+    });
+}
+
+// Full routed-MoE forward (decode path: GEMV kernels).
+at::Tensor moe_forward(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at::Tensor ptrs, int64_t I, int64_t K,
+                       int64_t n_experts) {
+    return moe_forward_impl(x, topk_ids, topk_w, nullptr, ptrs, I, K, n_experts, nullptr, nullptr, nullptr, nullptr);
+}
+
+// Same, with the device expert cache for layer `layer` (see launch_ensure). Prefill sizes (M >= prefill_min_m) skip the
+// cache (no fills; the caller stages layers instead).
+at::Tensor moe_forward_cached(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at::Tensor ptrs_all, int64_t layer,
+                              at::Tensor slot_of, at::Tensor slot_key, at::Tensor slot_last, at::Tensor tick,
+                              at::Tensor host_base, int64_t slot_base, at::Tensor fill_all, at::Tensor fill_list,
+                              int64_t max_fill, int64_t I, int64_t K, int64_t n_experts, at::Tensor pend,
+                              at::Tensor done_seq) {
+    TORCH_CHECK(ptrs_all.scalar_type() == at::kLong && fill_all.scalar_type() == at::kLong && slot_of.scalar_type() == at::kInt);
+    int E = (int)n_experts, M = x.size(0);
+    int64_t* pa = ptrs_all.data_ptr<int64_t>();
+    int64_t* fa = fill_all.data_ptr<int64_t>();
+    auto ptrs_l = ptrs_all.narrow(0, layer * E, E);
+    if (M == 0 || M >= g_prefill_min_m || slot_key.numel() == 0)
+        return moe_forward_impl(x, topk_ids, topk_w, nullptr, ptrs_l, I, K, n_experts, nullptr, nullptr, nullptr, nullptr);
+    auto& q = queue_of(x);
+    Geom gm{(int)x.size(1), (int)I, (int)K};
+    if (g_ram_res) TORCH_CHECK(topk_w.scalar_type() == at::kFloat && topk_ids.is_contiguous() && topk_w.is_contiguous(), "tier mask: int32 ids, fp32 w");
+    launch_ensure(q, topk_ids.data_ptr<int>(), M * (int)topk_ids.size(1), (int)layer, E, (int)slot_key.numel(), pa,
+                  slot_of.data_ptr<int>(), slot_key.data_ptr<int>(), slot_last.data_ptr<int>(), tick.data_ptr<int>(),
+                  host_base.data_ptr<int64_t>(), slot_base, (int64_t)gm.blob(), fa, fill_list.data_ptr<int>(),
+                  (int)std::min<int64_t>(max_fill, E), nullptr, nullptr, nullptr,
+                  pend.numel() ? pend.data_ptr<int>() : nullptr, done_seq.numel() ? done_seq.data_ptr<int>() : nullptr,
+                  (int)done_seq.numel(), g_ram_res ? topk_ids.data_ptr<int>() : nullptr,
+                  g_ram_res ? topk_w.data_ptr<float>() : nullptr);
+    if (g_vict) {
+        // a6: at most one victim per pick -> size the launch to min(max_fill, E, pairs), not E
+        int mf = (int)std::min<int64_t>(std::min<int64_t>(max_fill, E), (int64_t)M * topk_ids.size(1));
+        int chunks = (int)((gm.blob() / 4 + 16383) / 16384);
+        VictimCopyKernel vk{g_vict, host_base.data_ptr<int64_t>(), slot_base, (int64_t)gm.blob(), E, chunks,
+                            g_host_stride ? g_host_stride : (int64_t)gm.blob(), g_ram_res,
+                            g_vr_meta ? g_vr_sel : nullptr, g_vr_meta ? g_vr_base : 0};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)mf * chunks * 16, 16), vk); });
+    }
+    return moe_forward_impl(x, topk_ids, topk_w, nullptr, ptrs_l, I, K, n_experts, fa + layer * E, pa + layer * E,
+                            fa + layer * E, fill_list.data_ptr<int>());
+}
+
+static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, const int64_t* pp_override,
+                                   at::Tensor ptrs, int64_t I, int64_t K, int64_t n_experts, const int64_t* fill,
+                                   int64_t* commit_ptrs, int64_t* commit_fill, const int* fill_list) {
+    TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1);
+    TORCH_CHECK(topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous());
+    TORCH_CHECK(topk_w.scalar_type() == at::kFloat && topk_w.is_contiguous());
+    TORCH_CHECK(ptrs.scalar_type() == at::kLong && ptrs.is_contiguous());
+    int M = x.size(0), H = x.size(1), topk = topk_ids.size(1), E = (int)n_experts;
+    TORCH_CHECK(E <= 1024 && H % 128 == 0 && I % 128 == 0);
+    auto out = at::empty_like(x);
+    if (M == 0) return out;
+    auto& q = queue_of(x);
+    Geom gm{H, (int)I, (int)K};
+    int npairs = M * topk;
+    if (M >= g_prefill_min_m) return moe_prefill(x, topk_ids, topk_w, ptrs, gm, E, out);
+    bool pair_mode = M <= g_pair_max_m;
+    auto rb = make_route(x, pair_mode ? 1 : npairs, E);
+    if (pair_mode) {
+        rb.rt = Route{topk_ids.data_ptr<int>(), nullptr, nullptr, nullptr, nullptr, nullptr, topk_w.data_ptr<float>(), topk, npairs};
+        rb.pair_of = nullptr;
+    } else if (!(g_debug_skip & 8)) launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, 1, rb.act_expert,
+                 rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of);
+    rb.rt.fill = fill;
+    int max_act = pair_mode ? npairs : std::min(npairs, E);
+    auto abuf = at::empty({npairs, I}, x.options().dtype(at::kHalf));
+    auto y = at::empty({npairs, H}, x.options().dtype(at::kFloat));
+    // rows per expert chunk: 1 at M=1, else up to 4 (8 for bigger batches)
+    // B70, layer-0 experts, device slots: grouped M=16 MR=1/2/4 = 723/693/734 us; pair mode wins M<=4 (no align).
+    int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
+    const int64_t* pp = ptrs.data_ptr<int64_t>();
+    fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
+    TORCH_CHECK(K == 3, "moe: K=3 only in this build");
+    if (g_debug_skip & 1) {}
+    else if (x.scalar_type() == at::kHalf)
+        gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+    else if (x.scalar_type() == at::kBFloat16)
+        gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+    else TORCH_CHECK(false, "x dtype");
+    int dn_p_save = g_dn_p;
+    if (g_dn_p == 0) g_dn_p = M <= 1 ? 10 : 5;   // M=2: P=10 120.9 us vs P=5 112.8
+    if (!(g_debug_skip & 2)) down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
+    g_dn_p = dn_p_save;
+    int n = M * (H / 128), local = 8;
+    auto run_c = [&](auto tag) {
+        using TO = decltype(tag);
+        CombineKernel<TO> ck{y.data_ptr<float>(), rb.pair_of, reinterpret_cast<TO*>(out.data_ptr()), M, H, topk, (int)out.stride(0),
+                             commit_ptrs, commit_fill, fill_list};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((n + local - 1) / local * local, local), ck); });
+    };
+    if (!(g_debug_skip & 4)) { if (x.scalar_type() == at::kHalf) run_c(fp16{}); else run_c(bf16{}); }
+    return out;
+}
+
+// Debug: routing tables as tensors.
+std::vector<at::Tensor> moe_align(at::Tensor topk_ids, at::Tensor topk_w, int64_t n_experts, int64_t pad) {
+    int M = topk_ids.size(0), topk = topk_ids.size(1), E = (int)n_experts, npairs = M * topk;
+    auto rb = make_route(topk_ids, npairs, E);
+    launch_align(queue_of(topk_ids), topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, (int)pad,
+                 rb.act_expert, rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of);
+    return {rb.ib, rb.fb};
+}
+
+
+// ------------------------------------------------------------------------------------------------
+// Qwen3.8-Flash-Next n-gram table (exl3_ngram_trellis): rows of [fp16 scale word, 160 x K-bit tail-biting mul1
+// trellis] in USM host memory; one work-group (160 items) per looked-up row reads the packed row zero-copy and decodes
+// it (+ per-head fp16 bias). Same math as exllamav3 ngram_dequant_kernel (and the 3090 lane's ngram_gather_dequant).
+// table: chunk pointer table (device int64 [n_chunks]; sycl::malloc_host is limited to < ~30 GiB per allocation on
+// this driver, 16 GiB works), rows_per_chunk rows each (last chunk may be shorter).
+void ngram_gather_dequant(at::Tensor ids, at::Tensor chunk_ptrs, int64_t rows_per_chunk, int64_t num_rows,
+                          int64_t words, int64_t K, at::Tensor head_bias, at::Tensor out) {
+    TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_contiguous());
+    TORCH_CHECK(head_bias.scalar_type() == at::kHalf && out.is_contiguous());
+    TORCH_CHECK(out.scalar_type() == at::kBFloat16 || out.scalar_type() == at::kHalf);
+    int N = ids.numel();
+    if (N == 0) return;
+    auto& q = queue_of(ids);
+    const int64_t* idp = ids.data_ptr<int64_t>();
+    const int64_t* cps = chunk_ptrs.data_ptr<int64_t>();
+    int64_t RPC = rows_per_chunk;
+    const sycl::half* bias = reinterpret_cast<const sycl::half*>(head_bias.data_ptr());
+    int H = head_bias.size(0), W = (int)words, Kb = (int)K;
+    int64_t NR = num_rows;
+    bool is_bf = out.scalar_type() == at::kBFloat16;
+    void* op = out.data_ptr();
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint16_t, 1> sw(sycl::range<1>(64), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)N * 160, 160), [=](sycl::nd_item<1> it) {
+            int r = it.get_group(0), i = it.get_local_id(0);
+            int64_t row = idp[r];
+            bool valid = row >= 0 && row < NR;
+            if (i < W) {
+                uint16_t v = 0;
+                if (valid) {
+                    const uint16_t* tab = reinterpret_cast<const uint16_t*>(cps[row / RPC]);
+                    v = tab[(row % RPC) * W + i];
+                }
+                sw[i] = v;
+            }
+            sycl::group_barrier(it.get_group());
+            uint16_t sc = sw[0];
+            float scale = (float)sycl::bit_cast<sycl::half>(sc);
+            uint32_t state = 0;
+            for (int m = 0; m < 16; ++m) {
+                int pos = i - m / Kb;
+                if (pos < 0) pos += 160;
+                int sb = pos * Kb + m % Kb;
+                uint32_t bit = (sw[1 + (sb >> 4)] >> (sb & 15)) & 1u;
+                state |= bit << m;
+            }
+            uint32_t prod = state * 0x83DCD12Du;
+            float hsum = 1024.0f + (float)((prod & 0xff) + ((prod >> 8) & 0xff) + ((prod >> 16) & 0xff) + ((prod >> 24) & 0xff));
+            float k_inv = (float)sycl::bit_cast<sycl::half>((uint16_t)0x1eee);
+            float k_bias = (float)sycl::bit_cast<sycl::half>((uint16_t)0xc931);
+            float cb = (float)(sycl::half)(hsum * k_inv + k_bias);
+            float b = (float)bias[(size_t)(r % H) * 160 + i];
+            float v = (float)(sycl::half)(cb * scale + b);
+            if (is_bf) reinterpret_cast<sycl::ext::oneapi::bfloat16*>(op)[(size_t)r * 160 + i] = sycl::ext::oneapi::bfloat16(v);
+            else reinterpret_cast<sycl::half*>(op)[(size_t)r * 160 + i] = (sycl::half)v;
+        });
+    });
+}
+
+
+// ------------------------------------------------------------------------------------------------
+// QSA decode block selection (Qwen3.8-Flash-Next indexer), fused and bounded by the real context:
+//   score[j] = sum_h relu(q[h] . k_j) for compressed keys j < length[b] (k_j = cache[page_table[b][j / ps]][j % ps][0])
+//   out[b] = indices of the top-`topk` scores (any order), -1 padded
+// SGLang's torch fallback scores and top-ks the whole graph-sized page table (65,536 keys at 262k context) every step.
+// One work-group (1024) per row: scores -> scratch, exact top-k by radix select on order-preserving float keys.
+template <typename T>
+static void qsa_select_impl(sycl::queue& q, const T* qv, int H, int D, const T* cache, int ps, const int* pt, int maxp,
+                            const int* lens, float* scratch, int maxlen, int* out, int topk, int B, int Hr) {
+    constexpr int WG = 1024;
+    // 1) scores: key-parallel grid (one sub-group of 16 per key, 16 keys per work-group), groups past length exit
+    {
+        constexpr int KPW = 16;
+        int ngrp = (maxlen + KPW - 1) / KPW;
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> qs(sycl::range<1>(Hr * D), h);
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(B, (size_t)ngrp * KPW * 16), sycl::range<2>(1, KPW * 16)),
+                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int b = it.get_group(0), l = it.get_local_id(1);
+                int len = sycl::min(lens[b], sycl::min(maxlen, maxp * ps));
+                int j0 = it.get_group(1) * KPW;
+                if (j0 >= len || len <= topk) return;       // uniform per work-group
+                for (int i = l; i < Hr * D; i += KPW * 16) qs[i] = (float)qv[(size_t)b * H * D + i];
+                sycl::group_barrier(it.get_group());
+                auto sg = it.get_sub_group();
+                int ln = sg.get_local_id()[0];
+                int j = j0 + (int)sg.get_group_id()[0];
+                if (j >= len) return;
+                const T* k = cache + ((size_t)pt[(size_t)b * maxp + j / ps] * ps + j % ps) * D;
+                int nper = D / 16;
+                float kv[16];
+                for (int x = 0; x < nper && x < 16; ++x) kv[x] = (float)k[ln * nper + x];
+                float acc = 0.0f;
+                for (int hh = 0; hh < Hr; ++hh) {
+                    float d = 0.0f;
+                    for (int x = 0; x < nper && x < 16; ++x) d += qs[hh * D + ln * nper + x] * kv[x];
+                    d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+                    acc += sycl::fmax(d, 0.0f);
+                }
+                if (ln == 0) scratch[(size_t)b * maxlen + j] = acc;
+            });
+        });
+    }
+    // 2) exact top-k selection, one work-group per row
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(H * D), h);
+        sycl::local_accessor<int, 1> hist(sycl::range<1>(256), h), sc(sycl::range<1>(8), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)B * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            int b = it.get_group(0), l = it.get_local_id(0);
+            auto g = it.get_group();
+            using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                          sycl::access::address_space::local_space>;
+            for (int i = l; i < H * D; i += WG) qs[i] = (float)qv[(size_t)b * H * D + i];
+            if (l < 8) sc[l] = 0;
+            sycl::group_barrier(g);
+            int len = sycl::min(lens[b], sycl::min(maxlen, maxp * ps));
+            float* s = scratch + (size_t)b * maxlen;
+            int* o = out + (size_t)b * topk;
+            if (len <= topk) {                                   // everything is selected
+                for (int j = l; j < topk; j += WG) o[j] = j < len ? j : -1;
+                return;
+            }
+            sycl::group_barrier(g, sycl::memory_scope::work_group);
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+            // radix select of the topk-th largest: descending order key u = ~orderable(bits)
+            auto ukey = [](float f) -> uint32_t {
+                uint32_t bits = sycl::bit_cast<uint32_t>(f);
+                uint32_t ord = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);   // ascending with f
+                return ~ord;                                                              // ascending = descending f
+            };
+            // chunked ownership + run-aggregated SLM atomics + common-prefix skip (scores share their top bytes)
+            const int C = (len + WG - 1) / WG, c0 = l * C, c1 = sycl::min(len, c0 + C);
+            uint32_t umin = 0xFFFFFFFFu, umax = 0;
+            for (int j = c0; j < c1; ++j) { uint32_t u = ukey(s[j]); umin = sycl::min(umin, u); umax = sycl::max(umax, u); }
+            umin = sycl::reduce_over_group(g, umin, sycl::minimum<uint32_t>());
+            umax = sycl::reduce_over_group(g, umax, sycl::maximum<uint32_t>());
+            int top = 24;
+            while (top > 0 && ((umin ^ umax) >> top) == 0) top -= 8;
+            uint32_t prefix = top == 24 ? 0u : (umin & (0xFFFFFFFFu << (top + 8)));
+            int want = topk;
+            for (int shift = top; shift >= 0; shift -= 8) {
+                if (l < 256) hist[l] = 0;
+                sycl::group_barrier(g);
+                uint32_t hmask = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+                int rb = -1, rn = 0;
+                for (int j = c0; j < c1; ++j) {
+                    uint32_t u = ukey(s[j]);
+                    if ((u & hmask) != (prefix & hmask)) continue;
+                    int bb = (u >> shift) & 255;
+                    if (bb != rb) { if (rn) lref(hist[rb]).fetch_add(rn); rb = bb; rn = 0; }
+                    ++rn;
+                }
+                if (rn) lref(hist[rb]).fetch_add(rn);
+                sycl::group_barrier(g);
+                int c = l < 256 ? hist[l] : 0;
+                int cum = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+                if (l < 256 && cum < want && want <= cum + c) { sc[4] = l; sc[5] = want - cum; }
+                sycl::group_barrier(g);
+                prefix |= (uint32_t)sc[4] << shift;
+                want = sc[5];
+                sycl::group_barrier(g);
+            }
+            for (int j = l; j < len; j += WG) {
+                uint32_t u = ukey(s[j]);
+                if (u < prefix) o[lref(sc[0]).fetch_add(1)] = j;
+            }
+            sycl::group_barrier(g);
+            int nlt = sc[0];                                   // == topk - want
+            for (int j = l; j < len; j += WG) {
+                uint32_t u = ukey(s[j]);
+                if (u == prefix) {
+                    int k2 = lref(sc[1]).fetch_add(1);
+                    if (k2 < want) o[nlt + k2] = j;
+                }
+            }
+        });
+    });
+}
+
+void qsa_decode_select(at::Tensor qv, at::Tensor cache, at::Tensor page_table, at::Tensor lengths, at::Tensor scratch,
+                       at::Tensor out, int64_t topk, int64_t real_heads) {
+    TORCH_CHECK(qv.is_contiguous() && cache.is_contiguous() && page_table.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK(page_table.scalar_type() == at::kInt && lengths.scalar_type() == at::kInt && out.scalar_type() == at::kInt);
+    TORCH_CHECK(qv.scalar_type() == cache.scalar_type(), "q / cache dtype");
+    int B = qv.size(0), H = qv.size(1), D = qv.size(2);
+    int ps = cache.size(1), maxp = page_table.size(1), maxlen = scratch.size(1);
+    int Hr = real_heads > 0 && real_heads < H ? (int)real_heads : H;   // padded query heads are zero
+    TORCH_CHECK(D % 16 == 0 && D / 16 <= 16, "qsa_decode_select: head dim");
+    auto& q = queue_of(qv);
+    if (qv.scalar_type() == at::kBFloat16)
+        qsa_select_impl<bf16>(q, reinterpret_cast<const bf16*>(qv.data_ptr()), H, D, reinterpret_cast<const bf16*>(cache.data_ptr()),
+                              ps, page_table.data_ptr<int>(), maxp, lengths.data_ptr<int>(), scratch.data_ptr<float>(), maxlen,
+                              out.data_ptr<int>(), (int)topk, B, Hr);
+    else if (qv.scalar_type() == at::kHalf)
+        qsa_select_impl<sycl::half>(q, reinterpret_cast<const sycl::half*>(qv.data_ptr()), H, D,
+                                    reinterpret_cast<const sycl::half*>(cache.data_ptr()), ps, page_table.data_ptr<int>(), maxp,
+                                    lengths.data_ptr<int>(), scratch.data_ptr<float>(), maxlen, out.data_ptr<int>(), (int)topk, B, Hr);
+    else TORCH_CHECK(false, "qsa_decode_select: bf16 / fp16 only");
+}
+
+// ------------------------------------------------------------------------------------------------
+// Host USM: sycl::malloc_host in torch's XPU context, returned as a CPU uint8 tensor (device-readable, zero-copy).
+at::Tensor host_alloc(int64_t nbytes) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    void* p = sycl::malloc_host((size_t)nbytes, q);
+    TORCH_CHECK(p, "sycl::malloc_host failed for ", nbytes, " bytes");
+    sycl::context ctx = q.get_context();
+    return at::from_blob(p, {nbytes}, [ctx](void* ptr) { sycl::free(ptr, ctx); },
+                         at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+}
+
+// 0 unknown (pageable), 1 host USM, 2 device USM, 3 shared USM
+int64_t usm_kind(int64_t ptr) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    auto k = sycl::get_pointer_type(reinterpret_cast<void*>(ptr), q.get_context());
+    return k == sycl::usm::alloc::host ? 1 : k == sycl::usm::alloc::device ? 2 : k == sycl::usm::alloc::shared ? 3 : 0;
+}
+
+// Async copy of raw bytes on the CURRENT XPU stream (use torch.xpu.stream(s) to pick a second queue).
+void memcpy_async(int64_t dst, int64_t src, int64_t nbytes) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    q.memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), (size_t)nbytes);
+}
+
+int64_t blob_bytes(int64_t H, int64_t I, int64_t K) { return (int64_t)Geom{(int)H, (int)I, (int)K}.blob(); }
+
+}  // namespace moe
+
+TORCH_LIBRARY(exl3xpu_moe, m) {
+    m.def("moe_forward(Tensor x, Tensor topk_ids, Tensor topk_w, Tensor ptrs, int I, int K, int n_experts) -> Tensor");
+    m.impl("moe_forward", torch::kXPU, &moe::moe_forward);
+    m.def("moe_forward_cached(Tensor x, Tensor topk_ids, Tensor topk_w, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, "
+          "Tensor(c!) slot_key, Tensor(d!) slot_last, Tensor(e!) tick, Tensor host_base, int slot_base, Tensor(f!) fill_all, "
+          "Tensor(g!) fill_list, int max_fill, int I, int K, int n_experts, Tensor(h!) pend, Tensor done_seq) -> Tensor");
+    m.impl("moe_forward_cached", torch::kXPU, &moe::moe_forward_cached);
+    m.def("moe_prefetch(Tensor ids, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, Tensor(c!) slot_key, "
+          "Tensor(d!) slot_last, Tensor tick, Tensor host_base, int slot_base, Tensor(e!) pf_list, Tensor(f!) pf_slot, "
+          "int max_fill, int n_experts, int blob) -> ()");
+    m.impl("moe_prefetch", torch::kXPU, &moe::moe_prefetch);
+    m.def("moe_prefetch_plan(Tensor ids, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, Tensor(c!) slot_key, "
+          "Tensor(d!) slot_last, Tensor tick, Tensor host_base, int slot_base, Tensor(e!) pf_list, Tensor(f!) pf_slot, "
+          "Tensor(g!) plans, Tensor(h!) plan_seq, Tensor(i!) pend, Tensor done_seq, int max_fill, int n_experts, int blob) -> ()");
+    m.impl("moe_prefetch_plan", torch::kXPU, &moe::moe_prefetch_plan);
+    m.def("moe_prefetch_worker_start(Tensor plans, Tensor host_base_cpu, int slot_base, int blob, Tensor ptrs_all, "
+          "Tensor slot_last, Tensor commit_host, Tensor done_seq, int n_layers, int n_experts) -> ()", &moe::moe_prefetch_worker_start);
+    m.def("moe_prefetch_worker_stop() -> int[]", &moe::moe_prefetch_worker_stop);
+    m.def("moe_align(Tensor topk_ids, Tensor topk_w, int n_experts, int pad) -> Tensor[]");
+    m.impl("moe_align", torch::kXPU, &moe::moe_align);
+    m.def("host_alloc(int nbytes) -> Tensor", &moe::host_alloc);
+    m.def("usm_kind(int ptr) -> int", &moe::usm_kind);
+    m.def("memcpy_async(int dst, int src, int nbytes) -> ()", &moe::memcpy_async);
+    m.def("blob_bytes(int H, int I, int K) -> int", &moe::blob_bytes);
+    m.def("qsa_decode_select(Tensor q, Tensor cache, Tensor page_table, Tensor lengths, Tensor(a!) scratch, Tensor(b!) out, int topk, int real_heads) -> ()");
+    m.impl("qsa_decode_select", torch::kXPU, &moe::qsa_decode_select);
+    m.def("ngram_gather_dequant(Tensor ids, Tensor chunk_ptrs, int rows_per_chunk, int num_rows, int words, int K, Tensor head_bias, Tensor(a!) out) -> ()");
+    m.impl("ngram_gather_dequant", torch::kXPU, &moe::ngram_gather_dequant);
+    m.def("moe_set_splits(int gu_p, int dn_p) -> ()", &moe::moe_set_splits);
+    m.def("moe_set_mr(int mr) -> ()", &moe::moe_set_mr);
+    m.def("moe_set_debug(int v) -> ()", &moe::moe_set_debug);
+    m.def("moe_set_pair_max_m(int v) -> ()", &moe::moe_set_pair_max_m);
+    m.def("moe_set_prefill_min_m(int v) -> ()", &moe::moe_set_prefill_min_m);
+    m.def("moe_set_victims(Tensor v) -> ()", &moe::moe_set_victims);
+    m.def("moe_set_victim_ring(Tensor meta, Tensor sel, Tensor buf) -> ()", &moe::moe_set_victim_ring);
+    m.def("moe_set_tier(Tensor ram_res, Tensor miss, Tensor safe) -> ()", &moe::moe_set_tier);
+    m.def("moe_set_host_stride(int s) -> ()", &moe::moe_set_host_stride);
+    m.def("moe_svm_prefetch(Tensor ptrs, int nbytes, Tensor like) -> ()", &moe::moe_svm_prefetch);
+}

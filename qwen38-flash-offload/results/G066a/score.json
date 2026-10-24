@@ -1,0 +1,63 @@
+{
+ "positions": 2154,
+ "top1_agreement": 1.0,
+ "mean_kl_top20": 0.0,
+ "per_prompt": [
+  {
+   "i": 0,
+   "positions": 384,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.8642297650130548
+  },
+  {
+   "i": 1,
+   "positions": 646,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.9426356589147287
+  },
+  {
+   "i": 2,
+   "positions": 31,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 1.0
+  },
+  {
+   "i": 3,
+   "positions": 163,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.9629629629629629
+  },
+  {
+   "i": 4,
+   "positions": 246,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.8979591836734694
+  },
+  {
+   "i": 5,
+   "positions": 355,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.9096045197740112
+  },
+  {
+   "i": 6,
+   "positions": 307,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.9379084967320261
+  },
+  {
+   "i": 7,
+   "positions": 22,
+   "top1": 1.0,
+   "kl": 0.0,
+   "greedy_match": 0.8095238095238095
+  }
+ ]
+}

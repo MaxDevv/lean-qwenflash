@@ -1,0 +1,54 @@
+{
+ "passed": false,
+ "proof": {
+  "gates": "load chat reasoning tools context",
+  "tps": 14.4,
+  "prefill": 984,
+  "served": "glm-5.3-flash"
+ },
+ "evidence": {
+  "ok": {
+   "load": true,
+   "chat": true,
+   "reasoning": true,
+   "tools": true,
+   "context": true,
+   "speed": false
+  },
+  "chat": {
+   "content": "red, yellow, blue",
+   "finish": "stop"
+  },
+  "reasoning": {
+   "thinking_chars": 43,
+   "content": "391"
+  },
+  "tools": {
+   "call": [
+    {
+     "id": "call_577c41facbc541a9a99be7df",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    }
+   ],
+   "reply": "The weather in Paris right now is **17\u00b0C** with an **overcast** sky.",
+   "finish": "stop",
+   "calls_again": 0,
+   "thinking_chars": 70
+  },
+  "context": {
+   "prompt_tokens": 93437,
+   "seconds": 95.0,
+   "content": "58213"
+  },
+  "speed": {
+   "window_s": 30,
+   "tokens_total": 4453,
+   "seconds_total": 161.5
+  }
+ },
+ "seconds": 275.3
+}

@@ -1,0 +1,6 @@
+prefill 8192: 499.9 tok/s
+prefill 8192: 535.8 tok/s
+prefill 8192: 529.8 tok/s
+decode C1: aggregate 12.16 tok/s, per-stream 12.16
+decode C1@32k: 11.62 tok/s
+SWEEP DONE runs/P003-glm53-nvme-image-smoke/ab/sweep_B_campaign.json

@@ -45,7 +45,7 @@ Qwen3.8-Flash-Next activates only 10 of its 512 experts per layer per token (~2%
 ### 2. Install
 
 ```bash
-git clone --recurse-submodules https://github.com/MaxDevv/lean-qwenflash.git
+git clone https://github.com/MaxDevv/lean-qwenflash.git
 cd qwen38-flash-offload
 
 python3 -m venv .venv

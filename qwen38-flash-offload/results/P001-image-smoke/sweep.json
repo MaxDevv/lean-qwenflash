@@ -1,0 +1,235 @@
+{
+ "card": "glm53-2x3090",
+ "config": "P001 image ghcr.io/0xsero/glm53-flash-offload@sha256:1159044a73d91804c25ffa0851d1668518220c631e2efd4e904b7cc0578a7e39 mode fast (README command)",
+ "started": "2026-10-01T12:30:45+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {},
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 706.8,
+   "min": 704.1,
+   "max": 715.1,
+   "n": 3,
+   "all": [
+    704.1,
+    706.8,
+    715.1
+   ]
+  },
+  "32768": {
+   "median": 952.9,
+   "min": 951.6,
+   "max": 954.1,
+   "n": 3,
+   "all": [
+    954.1,
+    952.9,
+    951.6
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 29.025,
+    "min": 28.35,
+    "max": 29.7,
+    "n": 2,
+    "all": [
+     29.7,
+     28.35
+    ]
+   },
+   "per_stream_mean": {
+    "median": 29.005,
+    "min": 28.33,
+    "max": 29.68,
+    "n": 2,
+    "all": [
+     29.68,
+     28.33
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 29.7,
+     "per_stream_mean": 29.68,
+     "per_stream_min": 29.68,
+     "tokens": 1838,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.61
+    },
+    {
+     "aggregate": 28.35,
+     "per_stream_mean": 28.33,
+     "per_stream_min": 28.33,
+     "tokens": 1248,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.49
+    }
+   ]
+  },
+  "C2": {
+   "aggregate": {
+    "median": 31.384999999999998,
+    "min": 31.29,
+    "max": 31.48,
+    "n": 2,
+    "all": [
+     31.29,
+     31.48
+    ]
+   },
+   "per_stream_mean": {
+    "median": 15.76,
+    "min": 15.74,
+    "max": 15.78,
+    "n": 2,
+    "all": [
+     15.78,
+     15.74
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 31.29,
+     "per_stream_mean": 15.78,
+     "per_stream_min": 11.45,
+     "tokens": 3050,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 3.91
+    },
+    {
+     "aggregate": 31.48,
+     "per_stream_mean": 15.74,
+     "per_stream_min": 14.13,
+     "tokens": 3163,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 2.9
+    }
+   ]
+  },
+  "C4": {
+   "aggregate": {
+    "median": 34.879999999999995,
+    "min": 34.37,
+    "max": 35.39,
+    "n": 2,
+    "all": [
+     35.39,
+     34.37
+    ]
+   },
+   "per_stream_mean": {
+    "median": 8.79,
+    "min": 8.69,
+    "max": 8.89,
+    "n": 2,
+    "all": [
+     8.89,
+     8.69
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 35.39,
+     "per_stream_mean": 8.89,
+     "per_stream_min": 6.44,
+     "tokens": 6467,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 6.47
+    },
+    {
+     "aggregate": 34.37,
+     "per_stream_mean": 8.69,
+     "per_stream_min": 6.48,
+     "tokens": 9172,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.7
+    }
+   ]
+  },
+  "C1@32k": {
+   "aggregate": {
+    "median": 27.85,
+    "min": 26.9,
+    "max": 28.8,
+    "n": 2,
+    "all": [
+     26.9,
+     28.8
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 26.9,
+     "per_stream_mean": 26.89,
+     "per_stream_min": 26.89,
+     "tokens": 3764,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 33.17
+    },
+    {
+     "aggregate": 28.8,
+     "per_stream_mean": 28.79,
+     "per_stream_min": 28.79,
+     "tokens": 1811,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.49
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "gates": {
+  "prefill_8192": {
+   "value": 706.8,
+   "best_known": null,
+   "pass": true
+  },
+  "prefill_32768": {
+   "value": 952.9,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 29.02,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C4": {
+   "value": 34.88,
+   "best_known": null,
+   "pass": true
+  }
+ },
+ "finished": "2026-10-01T12:49:58+0200"
+}

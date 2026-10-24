@@ -1,0 +1,16 @@
+[07:54:49] ready
+[07:54:49] panel
+{"positions": 2154, "top1_agreement": 1.0, "mean_kl_top20": 0.0}
+[07:56:47] greedy
+GREEDY_DIFF [False, False, False, False, False]
+[07:59:27] verify
+{"vram_checked":128,"vram_bad":0,"ram_checked":128,"ram_bad":0,"table_bad":0,"rows_stale_nonvram":6446,"home_bad_resident":0,"home_bad_nonresident":0,"ram_resident":4736,"vram_and_ram":1,"pinned":0,"dev_bad_rows":0}
+[07:59:55] sweep
+decode C1@32k: 13.77 tok/s
+SWEEP DONE runs/N116-glm53-nvme/s2/s3a_55g/sweep.json
+sweep exit 0
+[08:40:40] verify
+{"vram_checked":128,"vram_bad":0,"ram_checked":128,"ram_bad":0,"table_bad":0,"rows_stale_nonvram":6368,"home_bad_resident":0,"home_bad_nonresident":0,"ram_resident":4736,"vram_and_ram":1,"pinned":0,"dev_bad_rows":0}
+kcheck 2026-10-07T08:41:43+02:00 boot=2026-10-06 22:31:39 corrected_events=9863 gpu0_path_corrected_lines=2316
+CLEAN
+[08:41:43] ARM_DONE

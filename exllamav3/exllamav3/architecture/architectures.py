@@ -1,0 +1,143 @@
+from .arcee import ArceeModel
+from .afmoe import AfmoeModel
+from .apertus import ApertusModel
+from .cohere import CohereModel
+from .cohere2 import Cohere2Model
+from .decilm import DeciLMModel
+from .deepseek_v3 import DeepseekV3Model
+from .deepseek_v4 import DeepseekV4Model
+from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
+from .dflash_laguna import DFlashLagunaModel
+from .dots1 import Dots1Model
+from .ernie4_5 import Ernie4_5Model
+from .ernie4_5_moe import Ernie4_5MoEModel
+from .exaone4 import Exaone4Model
+from .gemma2 import Gemma2Model
+from .gemma3 import Gemma3Model, Gemma3TextModel
+from .gemma4 import Gemma4TextModel, Gemma4UnifiedTextModel
+from .glm4 import Glm4Model
+from .glm4_moe import Glm4MoeModel
+from .glm4v import Glm4VModel
+from .glm4v_moe import Glm4VMoeModel
+from .glm4_moe_lite import Glm4MoeLiteModel
+from .glm_moe_dsa import GlmMoeDsaModel
+from .glm5_next import Glm5NextModel
+from .gpt_oss import GptOssModel
+from .hcxvisionv2 import HCXVisionV2Model
+from .hy_v3 import HyV3Model
+from .hyperclovax import HyperClovaxModel
+from .iquestcoder import IQuestCoderModel
+from .kimi_linear import KimiLinearModel
+from .laguna import LagunaModel
+from .lfm2 import Lfm2Model
+from .lfm2_moe import Lfm2MoeModel
+from .llama import LlamaModel
+from .mimo import MiMoModel
+from .mimo_v2 import MiMoV2Model
+from .minimax_m2 import MiniMaxM2Model
+from .ministral3 import Ministral3Model
+from .mistral import MistralModel
+from .mistral3 import Mistral3Model
+from .mixtral import MixtralModel
+from .muse_glimmer import MuseGlimmerTextModel
+from .muse_glimmer_assistant import MuseGlimmerAssistantModel
+from .nemotronh import NemotronHModel
+from .olmo3 import Olmo3Model
+from .olmohybrid import OlmoHybridModel
+from .phi3 import Phi3Model
+from .qwen2 import Qwen2Model
+from .qwen2_5_vl import Qwen2_5VLModel
+from .qwen3 import Qwen3Model
+from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
+from .qwen4_exp import Qwen4ExpModel
+from .qwen3_moe import Qwen3MoeModel
+from .qwen3_next import Qwen3NextModel
+from .qwen3_vl import Qwen3VLModel
+from .qwen3_vl_moe import Qwen3VLMoeModel
+from .seedoss import SeedOssModel
+from .smollm3 import SmolLM3Model
+from .solar_open_moe import SolarOpenMoeModel
+from .spark2_5 import Spark2_5Model
+from .step3_5 import Step3_5Model
+from .step3_7 import Step3_7Model
+
+ARCHITECTURES = {
+    m.config_class.arch_string: {
+        "architecture": m.config_class.arch_string,
+        "config_class": m.config_class,
+        "model_class": m,
+    } for m in [
+        ArceeModel,
+        AfmoeModel,
+        ApertusModel,
+        CohereModel,
+        Cohere2Model,
+        DeciLMModel,
+        DeepseekV3Model,
+        DeepseekV4Model,
+        DFlashModel,
+        DFlash2Model,
+        DFlashLagunaModel,
+        Dots1Model,
+        Ernie4_5Model,
+        Ernie4_5MoEModel,
+        Exaone4Model,
+        Gemma2Model,
+        Gemma3Model,
+        Gemma3TextModel,
+        Gemma4TextModel,
+        Gemma4UnifiedTextModel,
+        Glm4Model,
+        Glm4MoeModel,
+        Glm4VModel,
+        Glm4VMoeModel,
+        Glm4MoeLiteModel,
+        GlmMoeDsaModel,
+        Glm5NextModel,
+        KimiLinearModel,
+        GptOssModel,
+        HCXVisionV2Model,
+        HyV3Model,
+        HyperClovaxModel,
+        IQuestCoderModel,
+        LagunaModel,
+        Lfm2Model,
+        Lfm2MoeModel,
+        LlamaModel,
+        MiMoModel,
+        MiMoV2Model,
+        MiniMaxM2Model,
+        Ministral3Model,
+        MistralModel,
+        Mistral3Model,
+        MixtralModel,
+        MuseGlimmerTextModel,
+        MuseGlimmerAssistantModel,
+        NemotronHModel,
+        Olmo3Model,
+        OlmoHybridModel,
+        Phi3Model,
+        Qwen2Model,
+        Qwen2_5VLModel,
+        Qwen3Model,
+        Qwen3_5Model,
+        Qwen3_5MoeModel,
+        Qwen3_5VLModel,
+        Qwen3_5VLMoeModel,
+        Qwen3MoeModel,
+        Qwen3NextModel,
+        Qwen3VLModel,
+        Qwen3VLMoeModel,
+        Qwen4ExpModel,
+        SeedOssModel,
+        SmolLM3Model,
+        SolarOpenMoeModel,
+        Spark2_5Model,
+        Step3_5Model,
+        Step3_7Model,
+    ]
+}
+
+def get_architectures():
+    return ARCHITECTURES

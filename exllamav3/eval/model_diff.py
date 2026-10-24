@@ -1,0 +1,497 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
+from exllamav3.util.file import disk_lru_cache
+from exllamav3.util.progress import ProgressBar
+from exllamav3.util.memory import free_mem
+from exllamav3.util.measures import compute_kl_div, compute_target_log_probs, cosine_error, sqnr
+from exllamav3.util.misc import prepend_hf_chat_context
+from exllamav3 import Config, Model, Tokenizer
+from exllamav3.loader import SafetensorsCollection, VariantSafetensorsCollection
+from datasets import load_dataset
+import torch
+import math
+import yaml
+from safetensors.torch import save_file
+
+torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
+
+def save_tensor(tensor, path: str, tensor_name: str = None):
+    if isinstance(tensor, dict):
+        save_file({
+            k: v for k, v in tensor.items()
+        }, path)
+    elif isinstance(tensor, list):
+        save_file({
+            f"tensor.{i}": t for i, t in enumerate(tensor)
+        }, path)
+    else:
+        save_file({
+            tensor_name or f"tensor": tensor
+        }, path)
+
+
+@disk_lru_cache("get_dataset_text")
+def get_dataset_text(spec: dict):
+    assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
+    dataset_text = "\n\n".join(
+        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split = "test")
+        ["text"]
+    )
+    return dataset_text
+
+
+def get_test_tokens(tokenizer, rows, eval_len = 2048, eval_stride = 2048):
+    with ProgressBar("Tokenizing", rows) as pb:
+        dataset_spec = { "dataset": "wiki2" }
+        eval_tokens = tokenizer.encode(get_dataset_text(dataset_spec))
+        num_tokens = eval_tokens.shape[-1]
+        seqs = []
+        for a in range(0, num_tokens - eval_len, eval_stride):
+            b = a + eval_len
+            seqs.append(eval_tokens[:, a:b])
+            pb.update(len(seqs))
+            if len(seqs) >= rows:
+                break
+    return torch.cat(seqs, dim = 0)[:, :]
+
+
+def ppl(input_ids_, logits_, vocab_size_):
+    logprob_sum_ = 0.0
+    logprob_count_ = 0
+    chunksize = 10240
+    b_ = 0
+    while b_ < logits_.shape[0]:
+        a_ = b_
+        b_ = min(b_ + chunksize, logits_.shape[0])
+        logits_f = logits_[a_:b_, :]
+        target_ids = input_ids_[a_ + 1:b_ + 1].to(logits_.device)
+        token_log_probs = compute_target_log_probs(logits_f, target_ids, vocab_size_)
+        logprob_sum_ += token_log_probs.sum().item()
+        logprob_count_ += target_ids.numel()
+    return logprob_sum_, logprob_count_
+
+
+@torch.inference_mode()
+def main(args):
+
+    device = torch.device(args.device)
+
+    config_a = Config.from_directory(args.model_a)
+    config_a.override_dynamic_seq_len(2048)
+    tokenizer = Tokenizer.from_config(config_a)
+    model_a = Model.from_config(config_a)
+
+    config_b = Config.from_directory(args.model_b)
+    config_b.override_dynamic_seq_len(2048)
+    model_b = Model.from_config(config_b)
+    vocab_size = tokenizer.actual_vocab_size
+
+    if args.no_reconstruct:
+        config_a.infer_params.no_reconstruct = True
+        config_b.infer_params.no_reconstruct = True
+
+    if args.cache_quant is not None:
+        split = [int(bits) for bits in args.cache_quant.split(",")]
+        if len(split) == 1:
+            sim_kvq = tuple(split) + tuple(split)
+        elif len(split) == 2:
+            sim_kvq = tuple(split)
+        else:
+            raise ValueError("Specify either one or two bitrates for cache quantization")
+        if args.cache_compand_a > 0.0:
+            sim_kvq = sim_kvq + (args.cache_compand_a,)
+    else:
+        sim_kvq = None
+
+    # Override tensors
+    if args.override:
+        with open(args.override, "r") as f:
+            comp = yaml.safe_load(f)
+        sources = {s["id"]: s["model_dir"] for s in comp["sources"]}
+        overrides = {o["key"]: sources[o["source"]] for o in comp["overrides"]}
+        collections = {}
+        for o_key, o_dir in overrides.items():
+            if o_dir not in collections:
+                collections[o_dir] = []
+            collections[o_dir].append(o_key)
+        if len(collections):
+            vstc = VariantSafetensorsCollection(config_a.stc)
+            for o_dir, o_keys in collections.items():
+                print(f" -- Overriding from: {o_dir}:")
+                for o_key in o_keys:
+                    print(f"      {o_key}")
+                vstc.add_stc(o_keys, SafetensorsCollection(o_dir))
+            config_a.stc = vstc
+
+    # Dataset
+    all_eval_ids = get_test_tokens(tokenizer, args.rows, args.length, args.length)
+    if args.gen_prompt:
+        all_eval_ids = prepend_hf_chat_context(tokenizer, all_eval_ids)
+
+    # Inputs
+    states_a = list(all_eval_ids.split(args.batch_size))
+    states_b = list(all_eval_ids.split(args.batch_size))
+    all_eval_ids = list(all_eval_ids.split(args.batch_size))
+
+    # Save input IDs
+    if args.save_input_ids:
+        print(f" -- Saving input IDs to: {args.save_input_ids}")
+        save_tensor(all_eval_ids, args.save_input_ids, "input_ids")
+
+    # Output logits
+    save_logits_a = []
+    save_logits_b = []
+
+    params_a = [{} for _ in range(len(states_a))]
+    params_b = [{} for _ in range(len(states_b))]
+
+    # Architecture-specific input preparation, as Model.forward does before the module chain:
+    # positions for attention, and e.g. the token ids DeepSeek-V4's hash-routed MoE layers need
+    for b in range(len(states_a)):
+        states_a[b] = model_a.prepare_inputs(states_a[b], params_a[b])
+        states_b[b] = model_b.prepare_inputs(states_b[b], params_b[b])
+
+    # Inference
+    for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
+
+        logits_layer = module_a == model_a.modules[-1]
+
+        # Load modules
+        config_a.stc.begin_deferred_load()
+        module_a.load(device if not module_a.caps.get("prefer_cpu") else "cpu")
+        config_a.stc.end_deferred_load()
+
+        config_b.stc.begin_deferred_load()
+        module_b.load(device if not module_b.caps.get("prefer_cpu") else "cpu")
+        config_b.stc.end_deferred_load()
+
+        # Error measures
+        max_diff = 0
+        rfn_error_sum = 0
+        cos_error_sum = 0
+        sqnr_sum = 0
+
+        # Similarity measures
+        topk_max = args.topk_max
+        logprob_sum = [0, 0]
+        logprob_count = [0, 0]
+        kl_div_sum_ab = 0
+        kl_div_sum_ba = 0
+        kl_ab_toks = []      # per-token KLD (A, B), for median/quantile statistics
+        conf_b_toks = []     # reference top-token probability per token, for bucketed KLD
+        topk_hits_sum = [[0] * topk_max, [0] * topk_max]
+        topk_hits_count = [[0] * topk_max, [0] * topk_max]
+        topk_agreement_sum = [0] * topk_max
+        topk_agreement_count = [0] * topk_max
+
+        for b in range(len(states_a)):
+
+            # Advance state
+            state_a = states_a[b]
+            state_b = states_b[b]
+            eval_ids = all_eval_ids[b]
+
+            params_a[b].update({"sim_kvq": sim_kvq})
+            params_a[b]["dev_cache"] = None
+            # Modules may hand back a view of a shared g_tensor_cache workspace (e.g. the
+            # hyperconnection head's collapsed state): both models on one device would alias the
+            # same buffer and later transients would overwrite it, so the harness keeps its own copy
+            state_a = module_a.prepare_for_device(state_a, params_a[b])
+            state_a = module_a.forward(state_a, params_a[b]).clone()
+
+            params_b[b].update({})
+            params_b[b]["dev_cache"] = None
+            state_b = module_b.prepare_for_device(state_b, params_b[b])
+            state_b = module_b.forward(state_b, params_b[b]).clone()
+
+            # Optionally override model A state for first layers
+            if idx < args.keep_b:
+                state_a = state_b.clone()
+
+            # Drop logits on last iteration
+            if not logits_layer:
+                states_a[b] = state_a
+                states_b[b] = state_b
+
+            # Copy logits to CPU if saving
+            else:
+                if save_logits_a:
+                    save_logits_a.append(state_a.cpu().split(1))
+                if save_logits_b:
+                    save_logits_b.append(state_b.cpu().split(1))
+
+            # Measure error
+            if not logits_layer:
+                rows = state_a.shape[0]
+                for j in range(rows):
+                    # Hyperconnection models carry the residual as (seq, streams, hidden): compare
+                    # the streams flattened to rows, the Frobenius norm needs 2D
+                    sa = state_a[j].reshape(-1, state_a.shape[-1]).to(float)
+                    sb = state_b[j].reshape(-1, state_b.shape[-1]).to(float)
+                    cos_error_sum += cosine_error(sa, sb)
+                    sqnr_sum += sqnr(sa, sb)
+                    sa -= sb
+                    rfn_error_sum += (torch.linalg.norm(sa, 'fro') / torch.linalg.norm(sb, 'fro').mean()).item()
+                    sa.abs_()
+                    md = ((sa.max().item()) / torch.linalg.norm(sb, 'fro').mean()).item()
+                    max_diff = max(max_diff, md)
+                    del sa, sb
+
+            # Perplexity, KL-div
+            if logits_layer:
+                rows = state_a.shape[0]
+                for j in range(rows):
+                    x = (state_a[j], state_b[j])
+                    input_ids = eval_ids[j]
+                    top_indices = []
+
+                    for i in [0, 1]:
+                        logits = x[i][:-1, :]
+                        logprob_sum__, logprob_count__ = ppl(input_ids, logits, vocab_size)
+                        logprob_sum[i] += logprob_sum__
+                        logprob_count[i] += logprob_count__
+
+                        _, top_index = torch.topk(logits, topk_max, dim = -1)
+                        top_index = top_index.cpu().view(-1, topk_max)
+                        top_indices.append(top_index)
+                        targets = input_ids[1:].view(-1, 1)
+
+                        for t in range(topk_max):
+                            top_slice = top_index[:, :t + 1]
+                            hits = torch.eq(targets, top_slice)
+                            row_hits = hits.any(dim = 1)
+                            topk_hits_sum[i][t] += row_hits.sum().item()
+                            topk_hits_count[i][t] += top_slice.shape[0]
+
+                    for t in range(topk_max):
+                        top_slice_a = top_indices[0][:, :t + 1]
+                        top_slice_b = top_indices[1][:, :t + 1]
+                        hits = torch.eq(top_slice_a, top_slice_b)
+                        row_hits = hits.all(dim = 1)
+                        topk_agreement_sum[t] += row_hits.sum().item()
+                        topk_agreement_count[t] += top_slice_a.shape[0]
+
+                    kl_vocab_size = min(vocab_size, x[0].shape[-1], x[1].shape[-1])
+                    kl_ab = compute_kl_div(x[0], x[1], kl_vocab_size)
+                    kl_div_sum_ab += kl_ab.mean().item()
+                    kl_div_sum_ba += compute_kl_div(x[1], x[0], kl_vocab_size).mean().item()
+
+                    # Per-token KLD and reference confidence. The mean KLD is dominated by
+                    # tokens where the reference itself is undecided
+                    kl_ab_toks.append(kl_ab.flatten().float().cpu())
+                    logits_b2 = x[1].view(-1, x[1].shape[-1])
+                    for cf_a in range(0, logits_b2.shape[0], 256):
+                        cf = logits_b2[cf_a:cf_a + 256, :kl_vocab_size].float()
+                        conf_b_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
+
+        # Print error
+        if not logits_layer:
+            rfn_error = rfn_error_sum / args.rows
+            cos_error = cos_error_sum / args.rows
+            sqnr_ = sqnr_sum / args.rows
+            print(
+                f" -- {module_a.key:40}"
+                f"   rfn_err: {rfn_error:.6f}"
+                f"   max_diff/norm: {max_diff:.6f}"
+                f"   sqnr: {sqnr_:9.6f}"
+                f"   cos_err: {cos_error:.6f}"
+            )
+
+        # Save logits
+        if logits_layer:
+            if args.save_logits_a:
+                print(f" -- Saving model A logits to: {args.save_logits_a}")
+                save_tensor(save_logits_a, args.save_logits_a, "logits")
+            if args.save_logits_b:
+                print(f" -- Saving model B logits to: {args.save_logits_b}")
+                save_tensor(save_logits_b, args.save_logits_b, "logits")
+
+        # Final ppl, kld
+        if logits_layer:
+            perplexity = [math.exp(-logprob_sum[i] / logprob_count[i]) for i in (0, 1)]
+            kl_div_ab = kl_div_sum_ab / args.rows
+            kl_div_ba = kl_div_sum_ba / args.rows
+
+        # Unload modules
+        module_a.unload()
+        config_a.stc.close()
+        free_mem()
+
+        module_b.unload()
+        config_b.stc.close()
+        free_mem()
+
+    # Perplexity for each model
+    print(f" -- A perplexity: {perplexity[0]:11.8f}")
+    print(f" -- B perplexity: {perplexity[1]:11.8f}")
+
+    # Probability of the test label being in the top K tokens, for each model
+    print(f" -- A label in top-K:")
+    for t in range(topk_max):
+        a_acc_ = topk_hits_sum[0][t] / topk_hits_count[0][t]
+        print(f"      K = {t+1}: {a_acc_:6.4f}")
+    print(f" -- B label in top-K:")
+    for t in range(topk_max):
+        a_acc_ = topk_hits_sum[1][t] / topk_hits_count[1][t]
+        print(f"      K = {t+1}: {a_acc_:6.4f}")
+
+    # Probability of exact top-K token match between models
+    print(f" -- Top-K agreement, A vs B:")
+    for t in range(topk_max):
+        topk_agree_ = topk_agreement_sum[t] / topk_agreement_count[t]
+        print(f"      K = {t+1}: {topk_agree_:6.4f}")
+
+    # KLD, either way around
+    print(f" -- KL divergence (A, B): {kl_div_ab:11.8f}")
+    print(f" -- KL divergence (B, A): {kl_div_ba:11.8f}")
+
+    # Robust per-token statistics
+    kl_ab_all = torch.cat(kl_ab_toks)
+    conf_b_all = torch.cat(conf_b_toks)
+    print(f" -- KL divergence (A, B), per-token: median {kl_ab_all.median().item():.8f}   p90 {kl_ab_all.quantile(0.9).item():.8f}")
+    print(f" -- KL divergence (A, B), by reference confidence:")
+    for c_lo, c_hi in [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 0.95), (0.95, 1.01)]:
+        mask = (conf_b_all >= c_lo) & (conf_b_all < c_hi)
+        n = mask.sum().item()
+        if n == 0:
+            continue
+        kb = kl_ab_all[mask]
+        print(
+            f"      B top-prob [{c_lo:4.2f}, {min(c_hi, 1.0):4.2f}): {100 * n / conf_b_all.numel():5.1f}% of tokens"
+            f"   mean {kb.mean().item():.6f}   median {kb.median().item():.6f}"
+        )
+
+    return kl_div_ab
+
+
+def print_cqs_tables(results, compands):
+    from tabulate import tabulate
+    for cq_a in compands:
+        title = "no compand" if cq_a == 0.0 else f"compand a = {cq_a:.2f}"
+        print()
+        print(f" -- KL divergence (A, B), {title}:")
+        rows = [
+            [f"K{cq_k}"] + [f"{results[cq_a][(cq_k, cq_v)]:.6f}" for cq_v in range(2, 9)]
+            for cq_k in range(2, 9)
+        ]
+        print(tabulate(
+            rows,
+            headers = [""] + [f"V{cq_v}" for cq_v in range(2, 9)],
+            tablefmt = "github",
+            stralign = "right",
+            floatfmt = ".6f"
+        ))
+
+
+def cache_quant_sweep(args):
+    compands = [0.0]
+    if args.cache_compand_a:
+        compands.append(args.cache_compand_a)
+    results = {cq_a: {} for cq_a in compands}
+    for cq_k in range(2, 9):
+        for cq_v in range(2, 9):
+            for cq_a in compands:
+                args.cache_quant = f"{cq_k},{cq_v}"
+                args.cache_compand_a = cq_a
+                kld = main(args)
+                results[cq_a][(cq_k, cq_v)] = kld
+
+    print_cqs_tables(results, compands)
+
+
+@torch.inference_mode()
+def cache_quant_sweep_fast(args):
+    """
+    Same sweep as cache_quant_sweep, but both models are loaded whole and the reference logits
+    are kept in VRAM, so the B model runs once and the A model loads once for all 49 (98 with
+    compand) cache settings. For models small enough to share the device with rows * length *
+    vocab_size fp16 reference logits.
+    """
+    device = torch.device(args.device)
+
+    compands = [0.0]
+    if args.cache_compand_a:
+        compands.append(args.cache_compand_a)
+
+    # Dataset
+    config_b = Config.from_directory(args.model_b)
+    config_b.override_dynamic_seq_len(2048)
+    tokenizer = Tokenizer.from_config(config_b)
+    vocab_size = tokenizer.actual_vocab_size
+    all_eval_ids = get_test_tokens(tokenizer, args.rows, args.length, args.length)
+    if args.gen_prompt:
+        all_eval_ids = prepend_hf_chat_context(tokenizer, all_eval_ids)
+    batches = [ids.to(device) for ids in all_eval_ids.split(args.batch_size)]
+
+    # Reference logits from model B, kept on the device
+    if args.no_reconstruct:
+        config_b.infer_params.no_reconstruct = True
+    model_b = Model.from_config(config_b)
+    model_b.load(device = args.device)
+    ref_logits = []
+    with ProgressBar("Model B reference", len(batches)) as pb:
+        for i, ids in enumerate(batches):
+            ref_logits.append(model_b.forward(ids, {}).half())
+            pb.update(i + 1)
+    model_b.unload()
+    free_mem()
+
+    # Model A, loaded once for the whole sweep
+    config_a = Config.from_directory(args.model_a)
+    config_a.override_dynamic_seq_len(2048)
+    if args.no_reconstruct:
+        config_a.infer_params.no_reconstruct = True
+    model_a = Model.from_config(config_a)
+    model_a.load(device = args.device)
+
+    results = {cq_a: {} for cq_a in compands}
+    for cq_k in range(2, 9):
+        for cq_v in range(2, 9):
+            for cq_a in compands:
+                sim_kvq = (cq_k, cq_v) if cq_a == 0.0 else (cq_k, cq_v, cq_a)
+                kl_div_sum = 0.0
+                num_rows = 0
+                for ids, ref in zip(batches, ref_logits):
+                    logits_a = model_a.forward(ids, {"sim_kvq": sim_kvq})
+                    kl_vocab_size = min(vocab_size, logits_a.shape[-1], ref.shape[-1])
+                    for j in range(logits_a.shape[0]):
+                        kl_div_sum += compute_kl_div(logits_a[j], ref[j], kl_vocab_size).mean().item()
+                        num_rows += 1
+                    del logits_a
+                kld = kl_div_sum / num_rows
+                results[cq_a][(cq_k, cq_v)] = kld
+                print(f" -- K{cq_k} V{cq_v} a={cq_a:.2f}: kld {kld:11.8f}")
+
+    print_cqs_tables(results, compands)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(allow_abbrev = False)
+    parser.add_argument("-ma", "--model_a", type = str, help = "Model A", required = True)
+    parser.add_argument("-mb", "--model_b", type = str, help = "Model B", required = True)
+    parser.add_argument("-r", "--rows", type = int, help = "Number of rows, default: 100", default = 100)
+    parser.add_argument("-l", "--length", type = int, help = "Tokens per row, default: 2048", default = 2048)
+    parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
+    parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
+    parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
+    parser.add_argument("-or", "--override", type = str, help = "Model A tensor override spec (YAML)", default = None)
+    parser.add_argument("-si", "--save_input_ids", type = str, help = "Save input IDs (filename)", default = None)
+    parser.add_argument("-sla", "--save_logits_a", type = str, help = "Save model A logits (filename)", default = None)
+    parser.add_argument("-slb", "--save_logits_b", type = str, help = "Save model B logits (filename)", default = None)
+    parser.add_argument("-bsz", "--batch_size", type = int, help = "Batch size", default = 1)
+    parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row")
+    parser.add_argument("-nr", "--no_reconstruct", action = "store_true", help = "Avoid GEMM reconstruct (slow)")
+    parser.add_argument("-cq", "--cache_quant", type = str, help = "Simulate quantized cache for A model. Specify either kv_bits or k_bits,v_bits pair")
+    parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
+    parser.add_argument("-cqs", "--cache_quant_sweep", action = "store_true", help = "Sweep all k/v combinations and toggle compand if given, output KLD table")
+    parser.add_argument("-cqsf", "--cache_quant_sweep_fast", action = "store_true", help = "Sweep all k/v combinations, preload models")
+    _args = parser.parse_args()
+
+    if _args.cache_quant_sweep_fast:
+        cache_quant_sweep_fast(_args)
+    elif _args.cache_quant_sweep:
+        cache_quant_sweep(_args)
+    else:
+        main(_args)

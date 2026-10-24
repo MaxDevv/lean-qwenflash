@@ -1,0 +1,47 @@
+{
+ "ceiling_gbps": 26.0,
+ "members": [
+  "nvme3n1",
+  "nvme1n1",
+  "nvme0n1",
+  "nvme2n1"
+ ],
+ "phases": {
+  "prefill_8k": {
+   "seconds": 37.0,
+   "read_gbps": 11.28,
+   "pct_of_ceiling": 43.4,
+   "peak_1s_gbps": 21.27,
+   "md_iops": 90719,
+   "device_iops": 90719,
+   "avg_read_kb_device": 121.5
+  },
+  "prefill_32k": {
+   "seconds": 101.0,
+   "read_gbps": 10.05,
+   "pct_of_ceiling": 38.6,
+   "peak_1s_gbps": 18.29,
+   "md_iops": 80786,
+   "device_iops": 80786,
+   "avg_read_kb_device": 121.5
+  },
+  "decode_C1": {
+   "seconds": 223.8,
+   "read_gbps": 8.42,
+   "pct_of_ceiling": 32.4,
+   "peak_1s_gbps": 14.05,
+   "md_iops": 67666,
+   "device_iops": 67666,
+   "avg_read_kb_device": 121.5
+  },
+  "decode_C2": {
+   "seconds": 357.3,
+   "read_gbps": 9.92,
+   "pct_of_ceiling": 38.2,
+   "peak_1s_gbps": 14.44,
+   "md_iops": 79783,
+   "device_iops": 79783,
+   "avg_read_kb_device": 121.5
+  }
+ }
+}

@@ -1,0 +1,5 @@
+{
+ "chat": true,
+ "chat_nothink": true,
+ "tool_call": true
+}

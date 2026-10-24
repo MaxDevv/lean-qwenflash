@@ -1,0 +1,3 @@
+chat {"events": 2312, "chars": 11413, "span_s": 159.21, "half_share": 0.528, "tail_share": 0.006, "pass": true}
+generate {"events": 2137, "chars": 11416, "span_s": 147.67, "half_share": 0.509, "tail_share": 0.006, "pass": true}
+STREAM_RATE PASS

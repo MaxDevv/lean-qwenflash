@@ -1,0 +1,283 @@
+{
+ "recompute_w_u_fwd_kda_kernel": {
+  "keys": [
+   [
+    [
+     64,
+     64,
+     128,
+     128,
+     64,
+     64,
+     64,
+     false,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {},
+     "num_warps": 4,
+     "num_stages": 4
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {},
+   "num_warps": 4,
+   "num_stages": 4
+  }
+ },
+ "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
+  "keys": [
+   [
+    [
+     64,
+     64,
+     128,
+     128,
+     64,
+     false,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {
+      "BV": 32
+     },
+     "num_warps": 4,
+     "num_stages": 1
+    }
+   ],
+   [
+    [
+     64,
+     64,
+     128,
+     128,
+     64,
+     false,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.bfloat16"
+    ],
+    {
+     "kwargs": {
+      "BV": 32
+     },
+     "num_warps": 4,
+     "num_stages": 1
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {
+    "BV": 32
+   },
+   "num_warps": 4,
+   "num_stages": 1
+  }
+ },
+ "chunk_local_cumsum_vector_kernel": {
+  "keys": [
+   [
+    [
+     1,
+     64,
+     128,
+     64,
+     false,
+     false,
+     "torch.float32",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {
+      "BS": 32
+     },
+     "num_warps": 8,
+     "num_stages": 3
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {
+    "BS": 32
+   },
+   "num_warps": 8,
+   "num_stages": 3
+  }
+ },
+ "chunk_kda_fwd_kernel_inter_solve_fused": {
+  "keys": [
+   [
+    [
+     64,
+     64,
+     128,
+     64,
+     16,
+     4,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.bfloat16"
+    ],
+    {
+     "kwargs": {
+      "BK": 32
+     },
+     "num_warps": 1,
+     "num_stages": 3
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {
+    "BK": 32
+   },
+   "num_warps": 1,
+   "num_stages": 3
+  }
+ },
+ "chunk_kda_fwd_kernel_intra_token_parallel": {
+  "keys": [
+   [
+    [
+     128,
+     64,
+     64,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {
+      "BH": 4
+     },
+     "num_warps": 1,
+     "num_stages": 3
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {
+    "BH": 4
+   },
+   "num_warps": 1,
+   "num_stages": 3
+  }
+ },
+ "l2norm_fwd_kernel": {
+  "keys": [
+   [
+    [
+     128,
+     1,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {
+      "BT": 8
+     },
+     "num_warps": 1,
+     "num_stages": 3
+    }
+   ],
+   [
+    [
+     128,
+     4,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {
+      "BT": 32
+     },
+     "num_warps": 2,
+     "num_stages": 3
+    }
+   ],
+   [
+    [
+     128,
+     8,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32"
+    ],
+    {
+     "kwargs": {
+      "BT": 16
+     },
+     "num_warps": 2,
+     "num_stages": 3
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {
+    "BT": 16
+   },
+   "num_warps": 2,
+   "num_stages": 3
+  }
+ },
+ "chunk_gla_fwd_kernel_o": {
+  "keys": [
+   [
+    [
+     64,
+     64,
+     false,
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.float32",
+     "torch.bfloat16",
+     "torch.bfloat16",
+     "torch.bfloat16"
+    ],
+    {
+     "kwargs": {
+      "BK": 64,
+      "BV": 128
+     },
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   ]
+  ],
+  "default": {
+   "kwargs": {
+    "BK": 64,
+    "BV": 128
+   },
+   "num_warps": 4,
+   "num_stages": 2
+  }
+ }
+}

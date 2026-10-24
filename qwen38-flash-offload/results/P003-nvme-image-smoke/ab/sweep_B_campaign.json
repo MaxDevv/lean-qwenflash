@@ -1,0 +1,134 @@
+{
+ "card": "rtx-3090-24gb/glm-5.3-flash-offload",
+ "config": "P003-ab B_campaign",
+ "started": "2026-10-07T12:26:11+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {},
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 529.8,
+   "min": 499.9,
+   "max": 535.8,
+   "n": 3,
+   "all": [
+    499.9,
+    535.8,
+    529.8
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 12.165,
+    "min": 11.51,
+    "max": 12.82,
+    "n": 2,
+    "all": [
+     12.82,
+     11.51
+    ]
+   },
+   "per_stream_mean": {
+    "median": 12.165,
+    "min": 11.51,
+    "max": 12.82,
+    "n": 2,
+    "all": [
+     12.82,
+     11.51
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 12.82,
+     "per_stream_mean": 12.82,
+     "per_stream_min": 12.82,
+     "tokens": 1778,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 4.95
+    },
+    {
+     "aggregate": 11.51,
+     "per_stream_mean": 11.51,
+     "per_stream_min": 11.51,
+     "tokens": 2081,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.31
+    }
+   ],
+   "gpu_power_w_mean": 248.2
+  },
+  "C1@32k": {
+   "aggregate": {
+    "median": 11.620000000000001,
+    "min": 10.72,
+    "max": 12.52,
+    "n": 2,
+    "all": [
+     10.72,
+     12.52
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 10.72,
+     "per_stream_mean": 10.71,
+     "per_stream_min": 10.71,
+     "tokens": 3049,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 46.59
+    },
+    {
+     "aggregate": 12.52,
+     "per_stream_mean": 12.51,
+     "per_stream_min": 12.51,
+     "tokens": 1335,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 4.68
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "gates": {
+  "prefill_8192": {
+   "value": 529.8,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 12.16,
+   "best_known": null,
+   "pass": true
+  }
+ },
+ "prompt_sha256": [
+  "850fa36f78c1fa515e88c0c213cae77d7cf883321b8945148cdc99c501e4af49",
+  "a562cf0ea289bb7428d9fbb9c5e1b45376c33c58994d8fa3f63bdde2499fa939",
+  "1f03785bac018ab24ac1392137e41aa3864d0512a82e0df8e063b5817c3c6ea3",
+  "3102154161e48e59e9869612dca5388a852d5b1f18e119ec3b45e5b5b4fff7b3"
+ ],
+ "nonce_prefix": "f5896f6a3a824e227a2ca70413b5ccef",
+ "finished": "2026-10-07T12:40:05+0200"
+}

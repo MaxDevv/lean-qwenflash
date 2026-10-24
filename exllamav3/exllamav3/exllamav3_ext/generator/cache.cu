@@ -1,0 +1,253 @@
+#include <cuda_fp16.h>
+#include "cache.cuh"
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "../util.h"
+#include "../util.cuh"
+
+#define NUM_THREADS 512
+#define NUM_BLOCKS 128
+
+// Copies in units of T. Pages are a multiple of sizeof(T) bytes and the cache is a torch
+// allocation (256-byte aligned), so every page start is aligned to sizeof(T)
+template <typename T>
+__global__ __launch_bounds__(NUM_THREADS)
+void cache_rotate_kernel
+(
+    uint8_t* __restrict__ cache,
+    const int32_t* __restrict__ order,
+    uint8_t* __restrict__ temp,
+    const size_t page_size,
+    const size_t rotate_len
+)
+{
+    constexpr size_t W = sizeof(T);
+
+    // Chunk for current CTA. Chunks must stay W-byte aligned for the vector copies: round the
+    // split up to W (small pages, e.g. DSA HCA pools at 1792 B, would otherwise give misaligned
+    // per-CTA offsets; trailing CTAs just idle)
+    size_t block_size = CEIL_DIVIDE(CEIL_DIVIDE(page_size, gridDim.x), W) * W;
+    size_t block_beg = blockIdx.x * block_size;
+    size_t block_end = MIN(block_beg + block_size, page_size);
+    if (block_end <= block_beg) return;
+    block_size = block_end - block_beg;
+
+    // Rotate pages
+    for (int i = 0; i < rotate_len; ++i)
+    {
+        int64_t a = (int64_t) order[2 * i];
+        int64_t b = (int64_t) order[2 * i + 1];
+        uint8_t* dst = (a >= 0 ? cache + page_size * a : temp) + block_beg;
+        uint8_t* src = (b >= 0 ? cache + page_size * b : temp) + block_beg;
+        for (size_t offset = threadIdx.x * W; offset < block_size; offset += NUM_THREADS * W)
+            *((T*) (dst + offset)) = *((T*) (src + offset));
+        __syncthreads();
+    }
+}
+
+/*
+Reorder cache pages
+- cache, paged cache, shape (num_pages, ...), any dtype, contiguous
+- order, sequence to rotate, shape (2*n,), dtype int
+- temp, temp storage, sized as one cache page
+
+Performs:
+
+for i in range(n):
+    a = order[2*i]
+    b = order[2*i+1]
+    copy: (page[a] if a >= 0 else temp) <- (page[b] if b >= 0 else temp)
+
+Any page size: 16-byte vector copies when the page allows, narrower units otherwise (DeepSeek-V4
+HCA pools compress 128:1, so their quantized scale plane is 2 x 14 fp16 = 56 bytes per page)
+*/
+
+void cache_rotate
+(
+    const at::Tensor& cache,
+    const at::Tensor& order,
+    const at::Tensor& temp
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(cache.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(cache.dim() >= 2, "cache argument must have dim >= 2")
+    TORCH_CHECK(cache.is_contiguous(), "cache argument must be contiguous")
+    TORCH_CHECK(order.dim() == 1, "order argument must have dim == 1")
+    TORCH_CHECK_DTYPE(order, kInt);
+
+    size_t num_pages = cache.size(0);
+    size_t page_size = cache.nbytes() / num_pages;
+    size_t rotate_len = order.size(0) / 2;
+
+    TORCH_CHECK(temp.nbytes() == page_size, "temp tensor incorrect size");
+    if (!page_size || !rotate_len) return;
+
+    uint8_t* c = (uint8_t*) cache.data_ptr();
+    const int32_t* o = (const int32_t*) order.data_ptr();
+    uint8_t* t = (uint8_t*) temp.data_ptr();
+    uintptr_t align = (uintptr_t) c | (uintptr_t) t | page_size;
+    if      (align % 16 == 0) cache_rotate_kernel<uint4>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else if (align %  8 == 0) cache_rotate_kernel<uint2>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else if (align %  4 == 0) cache_rotate_kernel<uint32_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else if (align %  2 == 0) cache_rotate_kernel<uint16_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else                    { cache_rotate_kernel<uint8_t> <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
+    cuda_check(cudaPeekAtLastError());
+}
+
+constexpr int kPageSize = 256;
+constexpr int kThreads = 256;
+
+__global__ void dspark_write_rows_kernel
+(
+    const half* __restrict__ rows,       // (bsz, s, w)
+    half* __restrict__ kv,               // (pages, kPageSize, w)
+    const int* __restrict__ block_table, // (bsz, npr)
+    const int* __restrict__ seqlens,     // (bsz,)
+    const int s,
+    const int w,
+    const int npr
+)
+{
+    int b = blockIdx.y;
+    int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) s * w) return;
+    int r = (int) (i / w);
+    int c = (int) (i % w);
+    int pos = seqlens[b] + r;
+    int page = block_table[b * npr + pos / kPageSize];
+    kv[((int64_t) page * kPageSize + pos % kPageSize) * w + c] =
+        rows[((int64_t) b * s + r) * w + c];
+}
+
+void dspark_write_rows
+(
+    const at::Tensor& rows,
+    at::Tensor kv,
+    const at::Tensor& block_table,
+    const at::Tensor& cache_seqlens
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(rows.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(rows, kHalf);
+    TORCH_CHECK_DTYPE(kv, kHalf);
+    TORCH_CHECK_DTYPE(block_table, kInt);
+    TORCH_CHECK_DTYPE(cache_seqlens, kInt);
+    int bsz = (int) rows.size(0);
+    int s = (int) rows.size(1);
+    int w = (int) rows.size(2);
+    int64_t total = (int64_t) s * w;
+    dspark_write_rows_kernel<<<dim3(CEIL_DIVIDE(total, kThreads), bsz), kThreads, 0, stream>>>
+    (
+        (const half*) rows.data_ptr(),
+        (half*) kv.data_ptr(),
+        (const int*) block_table.data_ptr(),
+        (const int*) cache_seqlens.data_ptr(),
+        s, w, (int) block_table.size(1)
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+__global__ void paged_kv_update_vec8_kernel
+(
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cache_seqlens,
+    int B,
+    int S,
+    int H,
+    int D,
+    int max_blocks_per_seq,
+    int64_t total_vecs
+)
+{
+    const int64_t vecs_per_row = (int64_t) D >> 3;  // 8 halfs = 16 bytes = uint4
+    const int64_t row_vecs = (int64_t) H * vecs_per_row;
+    const int64_t seq_vecs = (int64_t) S * row_vecs;
+    const int64_t stride = (int64_t) blockDim.x * (int64_t) gridDim.x;
+
+    for (int64_t linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; linear < total_vecs; linear += stride)
+    {
+        const int64_t vec_id = linear % vecs_per_row;
+        const int64_t tmp0 = linear / vecs_per_row;
+        const int64_t h = tmp0 % H;
+        const int64_t tmp1 = tmp0 / H;
+        const int64_t s = tmp1 % S;
+        const int64_t b = tmp1 / S;
+
+        const int64_t logical_pos = int64_t(cache_seqlens[b]) + s;
+        const int64_t logical_block = logical_pos >> 8;
+        const int64_t page_offset = logical_pos & (kPageSize - 1);
+        const int64_t phys_block = int64_t(block_table[b * max_blocks_per_seq + logical_block]);
+
+        const int64_t src_elem = (((b * S + s) * H + h) * D) + (vec_id << 3);
+        const int64_t dst_elem = (((phys_block * kPageSize + page_offset) * H + h) * D) + (vec_id << 3);
+
+        *((uint4*)(k_cache + dst_elem)) = *((uint4*)(k + src_elem));
+        *((uint4*)(v_cache + dst_elem)) = *((uint4*)(v + src_elem));
+    }
+}
+
+void paged_kv_cache_update
+(
+    const at::Tensor& k,
+    const at::Tensor& v,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    at::Tensor& block_table,
+    at::Tensor& cache_seqlens
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k, kHalf);
+    TORCH_CHECK_DTYPE(v, kHalf);
+    TORCH_CHECK_DTYPE(k_cache, kHalf);
+    TORCH_CHECK_DTYPE(v_cache, kHalf);
+    TORCH_CHECK_DTYPE(block_table, kInt);
+    TORCH_CHECK_DTYPE(cache_seqlens, kInt);
+
+    TORCH_CHECK(k.dim() == 4, "k must have shape [B, S_new, H_k, D]");
+    TORCH_CHECK(v.dim() == 4, "v must have shape [B, S_new, H_k, D]");
+    TORCH_CHECK(k_cache.dim() == 4, "k_cache must have shape [num_blocks, 256, H_k, D]");
+    TORCH_CHECK(v_cache.dim() == 4, "v_cache must have shape [num_blocks, 256, H_k, D]");
+    TORCH_CHECK(block_table.dim() == 2, "block_table must have shape [B, max_blocks_per_seq]");
+    TORCH_CHECK(cache_seqlens.dim() == 1, "cache_seqlens must have shape [B]");
+
+    const int B = k.size(0);
+    const int S = k.size(1);
+    const int H = k.size(2);
+    const int D = k.size(3);
+    const int max_blocks_per_seq = block_table.size(1);
+
+    TORCH_CHECK_SHAPES_FULL(v, k);
+    TORCH_CHECK(k_cache.size(1) == 256, "this kernel needs page_size == 256");
+    TORCH_CHECK(v_cache.size(1) == 256, "this kernel needs page_size == 256");
+
+    if (B == 0 || S == 0 || H == 0 || D == 0) return;
+
+    const int max_grid = 65535;
+    TORCH_CHECK((D & 7) == 0, "dim must be divisible by 8");
+
+    const int64_t total_vecs = (int64_t) B * (int64_t) S * (int64_t) H * (int64_t) (D >> 3);
+    const int grid = std::min((int) CEIL_DIVIDE(total_vecs, (int64_t) kThreads), max_grid);
+    paged_kv_update_vec8_kernel<<<grid, kThreads, 0, stream>>>
+    (
+        (const half*) k.data_ptr(),
+        (const half*) v.data_ptr(),
+        (half*) k_cache.data_ptr(),
+        (half*) v_cache.data_ptr(),
+        (const int*) block_table.data_ptr(),
+        (const int*) cache_seqlens.data_ptr(),
+        B, S, H, D,
+        max_blocks_per_seq,
+        total_vecs
+    );
+    cuda_check(cudaPeekAtLastError());
+}

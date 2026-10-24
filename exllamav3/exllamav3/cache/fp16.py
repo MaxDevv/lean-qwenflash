@@ -1,0 +1,109 @@
+from __future__ import annotations
+from typing_extensions import override
+import torch
+from ..constants import PAGE_SIZE
+from .cache import CacheLayer
+from exllamav3.ext import exllamav3_ext as ext
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..modules import Attention
+    from ..model import Model, Config
+import numpy as np
+
+class CacheLayer_fp16(CacheLayer):
+
+    def __init__(
+        self,
+        config: Config | None,
+        attention: Attention,
+        cache_id: int,
+        max_num_tokens: int,
+    ):
+        super().__init__(config, attention, cache_id, max_num_tokens)
+
+        assert max_num_tokens % PAGE_SIZE == 0, \
+            f"max_num_tokens must be a multiple of {PAGE_SIZE}."
+
+        self.shape = (
+            (max_num_tokens // PAGE_SIZE, PAGE_SIZE, attention.num_kv_heads, attention.head_dim)
+            if attention else None
+        )
+        self.k = None
+        self.v = None
+        self.device = None
+
+
+    @override
+    def alloc(self, device: torch.device):
+        self.device = device
+        self.k = torch.zeros(self.shape, dtype = torch.half, device = device) if self.shape else None
+        self.v = torch.zeros(self.shape, dtype = torch.half, device = device) if self.shape else None
+
+
+    @override
+    def free(self):
+        self.device = None
+        self.k = None
+        self.v = None
+
+
+    @override
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
+        return self.k, self.v
+
+
+    @override
+    def update_kv(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        pass
+
+
+    @override
+    def update_kv_direct(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        ext.paged_kv_cache_update(k, v, self.k, self.v, block_table, cache_seqlens)
+
+
+    @override
+    def copy_page(self, source: CacheLayer_fp16, from_page: int, to_page: int, num_tokens: int):
+        assert self.shape == source.shape
+        self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
+        self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
+
+
+    @override
+    def get_tensors(self):
+        return [self.k, self.v]
+
+
+    @override
+    def storage_size(self):
+        return 2 * np.prod(self.shape) * torch.half.itemsize
+
+
+    @override
+    def overhead_size(self):
+        return 0
+
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_fp16,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens
+            }
+        }

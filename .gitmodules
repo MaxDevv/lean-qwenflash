@@ -1,6 +1,0 @@
-[submodule "exllamav3"]
-	path = exllamav3
-	url = https://github.com/turboderp-org/exllamav3.git
-[submodule "qwen38-flash-offload"]
-	path = qwen38-flash-offload
-	url = https://github.com/sybil-solutions/glm53-flash-offload.git

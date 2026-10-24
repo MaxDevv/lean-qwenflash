@@ -1,0 +1,156 @@
+{
+ "card": "rtx3090",
+ "config": "HOM-272 s16_r16 GLM53_NV_PREFETCH=1 GLM53_NV_MARGIN_GB=1.5 GLM53_NV_PF_RING=128 GLM53_ARGS=-rcs 1",
+ "started": "2026-10-08T14:38:01+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "api": "sglang",
+ "served_model": null,
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {
+  "prefill_32768": 2848,
+  "decode_C1": 63.7
+ },
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 640.4,
+   "min": 629.8,
+   "max": 658.7,
+   "n": 3,
+   "all": [
+    629.8,
+    658.7,
+    640.4
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 12.575,
+    "min": 11.78,
+    "max": 13.37,
+    "n": 2,
+    "all": [
+     13.37,
+     11.78
+    ]
+   },
+   "per_stream_mean": {
+    "median": 12.565,
+    "min": 11.77,
+    "max": 13.36,
+    "n": 2,
+    "all": [
+     13.36,
+     11.77
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 13.37,
+     "per_stream_mean": 13.36,
+     "per_stream_min": 13.36,
+     "tokens": 1835,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 2.61,
+     "streams": [
+      {
+       "t0": 1318.509070396,
+       "first": 1321.119520355,
+       "last": 1458.345597818,
+       "tokens": 1835,
+       "finish": "stop",
+       "response": "# The History of the Printing Press\n\n## Introduction\n\nThe printing press stands as one of the most transformative inventions in human history. By enabling the mass production of texts, it revolutionized the spread of knowledge, accelerated cultural and scientific progress, and fundamentally reshaped societies across the globe. This account traces the development of printing from its earliest precursors through the invention of movable type, its rapid spread across Europe, and its lasting impact on the modern world.\n\n## Early Precursors Before Gutenberg\n\n### Printing in East Asia\n\nPrinting technology did not begin in Europe. The earliest known printed text is the **Diamond Sutra**, produced in China in 868 CE using woodblock printing, a technique in which text and images were carved in reverse onto wooden blocks, inked, and pressed onto paper. Woodblock printing flourished in China, Korea, and Japan, where it was used to print Buddhist scriptures, government documents, and literary works.\n\nKorea made significant advances toward movable type. During the Goryeo Dynasty, Korean artisans developed metal movable type, and the **Jikji**, a Buddhist text printed around 1377, is recognized as the oldest surviving book printed with movable metal type\u2014predating Gutenberg's work by several decades. However, the complexity of the Chinese and Korean writing systems, with thousands of characters, limited the practical advantages of movable type in East Asia.\n\n### European Precursors\n\nIn medieval Europe, books were laboriously copied by hand, primarily in monastic scriptoria. A single scribe might take months or years to complete one manuscript, making books rare and expensive objects accessible mainly to the clergy, aristocracy, and wealthy merchants.\n\nBefore Gutenberg, Europeans experimented with simpler printing methods:\n\n- **Block books**: Short texts and images printed from single carved wooden blocks, popular in the mid-15th century.\n- **Textile stamping**: Techniques for printing patterns on cloth, which had existed since antiquity, provided a foundation for printing on paper.\n- **Woodcut printing**: Used for images and playing cards, demonstrating the feasibility of transferring ink under pressure.\n\n## Gutenberg and the Invention of Movable Type in Europe\n\n### Johannes Gutenberg\n\nThe decisive breakthrough came from **Johannes Gutenberg** (c. 1400\u20131468), a goldsmith from Mainz, Germany. Around 1440, Gutenberg began developing a complete printing system that combined several innovations:\n\n1. **Movable metal type**: Individual letters cast from a durable metal alloy\u2014primarily lead, tin, and antimony\u2014that could be arranged and rearranged to compose any text.\n2. **The type mold (hand mould)**: A precision instrument that allowed the rapid casting of identical letters, ensuring uniformity of type. This was arguably Gutenberg's most important technical achievement.\n3. **Oil-based ink**: A stickier, more durable ink than the water-based inks used for woodblocks, formulated to adhere evenly to metal type.\n4. **Adapted screw press**: Gutenberg modified the wine and paper presses already in use, applying even pressure to transfer ink cleanly onto paper.\n\n### The Gutenberg Bible\n\nAround 1455, Gutenberg completed his masterpiece: the **Gutenberg Bible** (also called the 42-line Bible). Approximately 180 copies were printed, of which about 49 survive today. Its remarkable quality demonstrated that printed books could rival manuscripts in beauty and durability. The project, however, was financially ruinous for Gutenberg, who lost his equipment and much of his business to his financier, Johann Fust, in a lawsuit around 1455.\n\n## The Rapid Spread of Printing Across Europe\n\nPrinting spread with extraordinary speed. Within decades of Gutenberg's breakthrough:\n\n- **1465**: Printing presses were established in Italy.\n- **1470**: Printing reached France and Spain.\n- **1473**: The first presses appeared in the Low Countries and Central Europe.\n- **1476**: William Caxton established England's first printing press at Westminster.\n\nBy 1500, presses operated in more than 250 European cities, and an estimated **20 million books** had been printed\u2014more books than European scribes had produced in the previous thousand years. The period's books are known as **incunabula** (\"from the cradle\"), referring to works printed before 1501.\n\nVenice emerged as an early printing capital, with publishers such as **Aldus Manutius** pioneering innovations like italic type and the portable, affordable octavo format that made classical texts accessible to a broader readership.\n\n## The Impact of the Printing Press\n\n### The Reformation\n\nThe printing press proved decisive in the Protestant Reformation. In 1517, **Martin Luther's Ninety-five Theses** spread throughout Germany within weeks and across Europe within months. Luther's prolific use of pamphlets\u2014written in clear, accessible German\u2014allowed his ideas to reach audiences that could never have been reached by manuscript. Without the press, the Reformation's rapid growth would have been virtually impossible. Both Protestant and Catholic authorities quickly recognized the power of print, leading to the first systematic efforts at censorship and the creation of indices of prohibited books.\n\n### The Scientific Revolution\n\nPrint enabled the standardization and wide dissemination of scientific knowledge. Scholars across Europe could now consult identical editions of texts, compare observations, and build cumulatively on one another's work. Landmark publications included:\n\n- **Copernicus's** *De revolutionibus* (1543), which proposed the heliocentric model.\n- **Andreas Vesalius's** anatomical treatises, enriched with detailed printed illustrations.\n- **Galileo's** works, which spread new astronomical discoveries to a wide audience.\n\nThe ability to print precise diagrams, tables, and mathematical notation was essential to the scientific method's development.\n\n### Literacy, Language, and Culture\n\nPrinted books made reading material far more affordable, stimulating rising literacy rates and the growth of secular education. Printing also encouraged the **standardization of vernacular languages**, as widely distributed books fixed spelling, grammar, and usage. Luther's Bible translation profoundly shaped the German language; similarly, printed works helped standardize English, French, Italian, and other European tongues.\n\nThe press also gave rise to new forms of media: newspapers first appeared in the early 17th century, and the first scientific journals in 1665, creating the foundations of modern public discourse and journalism.\n\n### Political and Social Change\n\nPrinted pamphlets and broadsheets became instruments of political debate, contributing to movements such as the English Civil War, the American Revolution, and the French Revolution. Thomas Paine's *Common Sense* (1776), for example, sold hundreds of thousands of copies and helped galvanize American independence. The press laid the groundwork for the modern concepts of public opinion, freedom of the press, and intellectual property (the first copyright statute, the Statute of Anne, was enacted in England in 1710).\n\n## Later Developments in Printing Technology\n\nThe printing press continued to evolve over the centuries:\n\n- **The Stanhope press (c. 1800)**: The first all-iron press, capable of printing larger sheets with less effort.\n- **Steam-powered printing (1810s\u20131830s)**: Friedrich Koenig's steam-driven cylinder press dramatically increased output; *The Times* of London adopted it in 1814.\n- **Rotary presses (1840s\u20131860s)**: Richard March Hoe's rotary press and later web-fed presses enabled printing tens of thousands of copies per hour, making mass-circulation newspapers possible.\n- **Linotype and Monotype (1880s\u20131890s)**: Machines that mechanically cast entire lines of type, greatly accelerating typesetting.\n- **Offset lithography (early 20th century)**: Became the dominant method for high-volume commercial printing.\n\n## Legacy\n\nThe printing press is often described as an \"agent of change\"\u2014a phrase popularized by historian Elizabeth Eisenstein\u2014because it transformed nearly every domain of human activity: religion, science, politics, law, education, and commerce. By making knowledge reproducible, portable, and affordable, it broke the monopoly of elites over information and created the conditions for mass literacy, public debate, and modern democracy.\n\nHistorians frequently draw parallels between Gutenberg's invention and the digital revolution of the late 20th century. Just as the printing press democratized access to the written word five centuries ago, the internet has democratized access to publishing itself\u2014a testament to how profoundly a single innovation in communication can reshape civilization.\n\n## Conclusion\n\nFrom the woodblock prints of Tang Dynasty China to Gutenberg's workshop in Mainz and onward to the steam-powered presses of the industrial age, the history of printing is a story of humanity's enduring drive to share knowledge. The printing press did not merely make books cheaper; it changed how people thought, learned, worshipped, and governed themselves. Its legacy endures in every newspaper, textbook, and digital publication that carries forward its fundamental mission: the wide and free circulation of ideas.",
+       "prompt_tokens": 26,
+       "prompt_sha256": "85bf2a887bb222f022d494dea653951821bbfde96264b7692b9cf1e088de2c97",
+       "delivered_timestamps": 1835
+      }
+     ]
+    },
+    {
+     "aggregate": 11.78,
+     "per_stream_mean": 11.77,
+     "per_stream_min": 11.77,
+     "tokens": 1458,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 2.46,
+     "streams": [
+      {
+       "t0": 1458.34837348,
+       "first": 1460.804625781,
+       "last": 1584.565191581,
+       "tokens": 1458,
+       "finish": "stop",
+       "response": "# TCP Congestion Control (Variant 100)\n\n## Overview\n\nTCP congestion control is a set of algorithms that prevent a sender from overwhelming the network. Because the Internet is a shared, best-effort network, no single authority tells a sender how fast it may transmit. Instead, each TCP sender *infers* available capacity from the feedback the network provides \u2014 acknowledgments (ACKs) arriving on time indicate a healthy path; losses and delays indicate congestion. Variant 100 follows the classic, widely deployed model: **slow start, congestion avoidance, fast retransmit/fast recovery, and a congestion window (cwnd)**, with modern refinements such as CUBIC-style window growth and ECN support.\n\n## The Core Idea: The Congestion Window\n\nTCP maintains two limits on in-flight data:\n\n- **Receive window (rwnd)** \u2014 flow control, imposed by the receiver (how much the receiver's buffer can absorb).\n- **Congestion window (cwnd)** \u2014 congestion control, imposed by the sender itself (how much the *network* can plausibly carry).\n\nThe sender may transmit up to:\n\n```\nEffectiveWindow = min(cwnd, rwnd)\n```\n\ncwnd is measured in bytes (often discussed in segments). The sender probes the network by increasing cwnd, backs off when congestion is detected, and repeats. This creates the characteristic **sawtooth** pattern of TCP throughput over time.\n\n## Signals of Congestion\n\nA sender detects congestion through three signals, in increasing order of severity:\n\n1. **Duplicate ACKs** \u2014 three or more duplicate ACKs suggest a single packet was lost, but later packets are still arriving. This indicates *mild* congestion.\n2. **Retransmission timeout (RTO)** \u2014 no ACKs at all arrive before the timer expires. This indicates *severe* congestion.\n3. **Explicit Congestion Notification (ECN)** \u2014 routers mark packets (CE bit) instead of dropping them; the receiver echoes the mark back (ECE), letting the sender react *before* loss occurs.\n\n## Phase 1: Slow Start\n\nDespite its name, slow start begins aggressively \u2014 it grows *exponentially*.\n\n- **Initialization:** cwnd starts small (traditionally 1 MSS; modern Linux uses an initial window of 10 segments, IW10).\n- **Growth rule:** for each ACK received, increase cwnd by one segment. Since a full window of ACKs arrives per round-trip time (RTT), cwnd roughly **doubles every RTT**: 1 \u2192 2 \u2192 4 \u2192 8 \u2192 16 ...\n- **Purpose:** rapidly discover the network's available bandwidth without immediately flooding it.\n- **Exit conditions:**\n  - cwnd reaches **ssthresh** (slow start threshold) \u2192 switch to congestion avoidance.\n  - Packet loss or ECN signal \u2192 enter recovery (see below).\n  - RTO fires \u2192 ssthresh is set to half the current flight size, cwnd resets to the initial window, and slow start begins again.\n\n## Phase 2: Congestion Avoidance\n\nOnce cwnd \u2265 ssthresh, exponential growth becomes too risky. The goal shifts to *gentle probing*:\n\n- **Growth rule:** increase cwnd by approximately **one segment per RTT** (linear growth), typically implemented as:\n\n```\ncwnd += MSS * MSS / cwnd   (per ACK)\n```\n\n  This is the classic **AIMD** (Additive Increase, Multiplicative Decrease) paradigm: increase slowly to find capacity, cut sharply when congestion appears. AIMD is valued because it converges to fair bandwidth sharing among competing flows.\n\n## Phase 3: Fast Retransmit and Fast Recovery\n\nWhen **three duplicate ACKs** arrive (indicating one lost packet but a still-functioning path):\n\n1. **Fast retransmit:** retransmit the missing segment immediately, without waiting for the RTO.\n2. **Fast recovery:**\n   - Set `ssthresh = flight_size / 2` (roughly half the current window).\n   - Set `cwnd = ssthresh` (in the NewReno variant, cwnd is inflated temporarily to keep the pipe full while the loss is repaired, then deflated when the loss is fully acknowledged).\n   - Enter **congestion avoidance directly** \u2014 skipping slow start, since ACKs prove the path is still delivering packets.\n\nThis \"halving\" response is the multiplicative-decrease half of AIMD.\n\n## Phase 4: Timeout Handling (Severe Congestion)\n\nIf the RTO fires, the network is presumed badly congested:\n\n```\nssthresh = max(flight_size / 2, 2 * MSS)\ncwnd     = initial window (e.g., 1\u201310 MSS)\n```\n\nSlow start restarts from scratch. This is the harshest penalty TCP can impose, which is why fast retransmit exists \u2014 to avoid it whenever possible.\n\n## Modern Refinements in Variant 100\n\n- **CUBIC window growth:** Instead of pure linear increase, the window grows as a cubic function of time since the last congestion event \u2014 fast ramp-up, long stable plateau near the previous maximum, then rapid re-probing. This suits high-bandwidth, long-delay networks.\n- **ECN (RFC 3168):** Routers mark packets at the onset of queue buildup; senders treat an ECN mark like a loss (halving cwnd) but without discarding data.\n- **Appropriate Byte Counting (ABC):** More accurate cwnd accounting based on bytes ACKed rather than ACK count, preventing under-growth when ACKs are delayed or combined.\n- **HyStart / pacing:** Prevent slow start from overshooting by detecting RTT increases and pacing packets smoothly rather than in bursts.\n\n## Summary Table\n\n| Event | ssthresh | cwnd | Phase after |\n|---|---|---|---|\n| Startup | initial (large) | 1\u201310 MSS | Slow start |\n| cwnd \u2265 ssthresh | unchanged | +1 MSS per RTT | Congestion avoidance |\n| 3 dup ACKs | flight/2 | = ssthresh | Fast recovery \u2192 CA |\n| RTO fires | flight/2 | reset to IW | Slow start |\n| ECN mark | flight/2 | = ssthresh | Congestion avoidance |\n\n## Key Takeaways\n\n1. **TCP has no explicit knowledge of network capacity** \u2014 it probes, reacts, and adapts using loss, delay, and ECN as feedback.\n2. **AIMD is the heart of the design:** additive increase ensures fairness and stability; multiplicative decrease ensures rapid relief under congestion.\n3. **Slow start is for discovery, congestion avoidance for steady state, fast recovery for graceful degradation, and timeout handling for emergencies.**\n4. Variant 100's refinements (CUBIC, ECN, pacing) make the same feedback loop work efficiently on modern high-speed networks, where classic Reno would take too long to recover its window after each loss.",
+       "prompt_tokens": 25,
+       "prompt_sha256": "9e585606b22299b5a4729e202d5dfe8d5266ff44703c5ae7fd166fea51757daf",
+       "delivered_timestamps": 1458
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "marks": [
+  {
+   "phase": "prefill_8k",
+   "t0": 1791463091.6448889,
+   "t1": 1791463129.8917751
+  },
+  {
+   "phase": "decode_C1",
+   "t0": 1791463129.8920798,
+   "t1": 1791463396.2153046
+  }
+ ],
+ "prompt_seed": 1791463081,
+ "prefill_prompt_receipts": [
+  {
+   "tokens": 8192,
+   "rep": 0,
+   "prompt_sha256": "ba07c189adc3f39c0ca917e63aebf4f9be057764c4a3a1112c947c3205f166f2",
+   "ttft_s": 13.006828670000004
+  },
+  {
+   "tokens": 8192,
+   "rep": 1,
+   "prompt_sha256": "ed0e7b17992ac18cc538a22a2540be3867cac7b8c54572ac335f720cdcf211ec",
+   "ttft_s": 12.436113030999877
+  },
+  {
+   "tokens": 8192,
+   "rep": 2,
+   "prompt_sha256": "3908cb678a949e2c66d8ef8d35427a06cd74aa0c37927e80027b50bb66592a45",
+   "ttft_s": 12.79106516800016
+  }
+ ],
+ "gates": {
+  "prefill_8192": {
+   "value": 640.4,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 12.57,
+   "best_known": 63.7,
+   "pass": false
+  }
+ },
+ "finished": "2026-10-08T14:43:16+0200"
+}

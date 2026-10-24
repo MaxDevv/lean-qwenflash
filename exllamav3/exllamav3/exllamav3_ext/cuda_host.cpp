@@ -1,0 +1,99 @@
+#include "cuda_host.h"
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "util.h"
+
+void cuda_host_register(uintptr_t ptr, size_t nbytes, unsigned int flags)
+{
+    cudaError_t cr = cudaHostRegister(reinterpret_cast<void*>(ptr), nbytes, flags);
+
+    // A region can only be pinned once per process, but ranks sharing an arena may each try to
+    // register it. The runtime also records the returned error as the last error, so clear it or
+    // the next cudaGetLastError() elsewhere (torch's launch checks) attributes it to something
+    // unrelated
+    if (cr == cudaErrorHostMemoryAlreadyRegistered)
+    {
+        cudaGetLastError();
+        return;
+    }
+
+    TORCH_CHECK(
+        cr == cudaSuccess,
+        "cudaHostRegister(", reinterpret_cast<void*>(ptr), ", ", nbytes, ") failed: ",
+        cudaGetErrorString(cr)
+    );
+}
+
+void cuda_host_unregister(uintptr_t ptr)
+{
+    cudaError_t cr = cudaHostUnregister(reinterpret_cast<void*>(ptr));
+
+    // Teardown is racy by nature: the region may already have been released, or the runtime may
+    // be unloading while shared segments are still being torn down. Both are benign here
+    if (cr == cudaErrorHostMemoryNotRegistered || cr == cudaErrorCudartUnloading)
+    {
+        cudaGetLastError();
+        return;
+    }
+
+    TORCH_CHECK(
+        cr == cudaSuccess,
+        "cudaHostUnregister(", reinterpret_cast<void*>(ptr), ") failed: ", cudaGetErrorString(cr)
+    );
+}
+
+uintptr_t cuda_host_get_device_pointer(uintptr_t ptr)
+{
+    // Device-side alias of memory registered with cudaHostRegisterMapped. Equal to the host
+    // pointer under UVA (Linux desktop), but distinct under WDDM (native Windows, and potentially
+    // WSL2), where the host pointer is not usable in kernels and this alias must be passed instead
+    void* dev_ptr = nullptr;
+    cudaError_t cr = cudaHostGetDevicePointer(&dev_ptr, reinterpret_cast<void*>(ptr), 0);
+
+    TORCH_CHECK(
+        cr == cudaSuccess,
+        "cudaHostGetDevicePointer(", reinterpret_cast<void*>(ptr), ") failed: ",
+        cudaGetErrorString(cr)
+    );
+
+    return reinterpret_cast<uintptr_t>(dev_ptr);
+}
+
+int cuda_device_get_attribute(int attr, int device)
+{
+    int value = 0;
+#if defined(USE_ROCM)
+    // The caller passes CUDA's cudaDeviceAttr numbering (model_tp_cuda.py), which HIP's attribute enum does
+    // not share: translate the values in use rather than query whatever attribute HIP has at that number
+    TORCH_CHECK(attr == 91, "cuda_device_get_attribute: CUDA attribute ", attr, " has no HIP mapping here");
+    cudaError_t cr = cudaDeviceGetAttribute(&value, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+#else
+    cudaError_t cr = cudaDeviceGetAttribute(&value, static_cast<cudaDeviceAttr>(attr), device);
+#endif
+
+    TORCH_CHECK(
+        cr == cudaSuccess,
+        "cudaDeviceGetAttribute(", attr, ", ", device, ") failed: ", cudaGetErrorString(cr)
+    );
+
+    return value;
+}
+
+at::Tensor pinned_cuda_view(const at::Tensor& t, int64_t device)
+{
+    // CUDA-device alias of a pinned host tensor: same storage, but with a device dtype/layout
+    // so torch ops (matmul/cuBLAS) and extension kernels accept it directly, reading over PCIe
+    // (zero-copy). The view does NOT own the memory; the caller must keep the pinned source
+    // tensor alive for the alias's lifetime. Uses cudaHostGetDevicePointer rather than assuming
+    // UVA pointer equality so the alias also holds under WDDM
+    TORCH_CHECK(t.device().is_cpu(), "pinned_cuda_view: tensor must be a CPU tensor");
+    TORCH_CHECK(t.is_pinned(), "pinned_cuda_view: tensor must be pinned");
+    void* dev_ptr = nullptr;
+    cudaError_t cr = cudaHostGetDevicePointer(&dev_ptr, t.data_ptr(), 0);
+    TORCH_CHECK(
+        cr == cudaSuccess,
+        "cudaHostGetDevicePointer(", t.data_ptr(), ") failed: ", cudaGetErrorString(cr)
+    );
+    auto options = t.options().device(at::kCUDA, static_cast<c10::DeviceIndex>(device));
+    return at::from_blob(dev_ptr, t.sizes(), t.strides(), [](void*) {}, options);
+}

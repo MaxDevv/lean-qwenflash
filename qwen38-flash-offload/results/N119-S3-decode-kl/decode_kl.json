@@ -1,0 +1,76 @@
+{
+ "control_off": {
+  "positions": 1088,
+  "kl_mean": 0.0,
+  "kl_p99": 0.0,
+  "kl_max": 0.0,
+  "top1_agree": 1.0,
+  "forced_mismatch": [
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  "cpu_experts_per_layer_call": 0.0
+ },
+ "cpu_default": {
+  "positions": 1088,
+  "kl_mean": 0.004677131945043902,
+  "kl_p99": 0.08179178833961487,
+  "kl_max": 0.25877320766448975,
+  "top1_agree": 0.9862132352941176,
+  "forced_mismatch": [
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  "cpu_experts_per_layer_call": 3.5505295868347337
+ },
+ "cpu_noclamp": {
+  "positions": 1088,
+  "kl_mean": 0.006347528704208453,
+  "kl_p99": 0.11588531732559204,
+  "kl_max": 0.6156660318374634,
+  "top1_agree": 0.9834558823529411,
+  "forced_mismatch": [
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  "cpu_experts_per_layer_call": 3.5638786764705883
+ },
+ "_meta": {
+  "tokens_per_prompt": 192,
+  "prompts": 6,
+  "seconds": 494.9,
+  "cpu_selftest": {
+   "EXACT": 0.001002,
+   "AFFINE": 0.001061,
+   "I16": 0.001077
+  },
+  "pol": [
+   0.17,
+   0.023,
+   0.38,
+   0.145,
+   0.165,
+   0.04,
+   0.4,
+   0.12,
+   0.395,
+   0.75,
+   1.0,
+   1.0,
+   32.0,
+   1.0
+  ]
+ }
+}

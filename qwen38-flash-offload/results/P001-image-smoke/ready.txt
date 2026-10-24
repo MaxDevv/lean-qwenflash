@@ -1,0 +1,2 @@
+readme ready=1 after 141 s
+registry ready=1 after 141 s

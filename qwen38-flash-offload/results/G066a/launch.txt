@@ -1,0 +1,12 @@
+python3 /w/glm53/serve_exl3.py -m /models/turboderp-GLM-5.3-Flash-exl3-3.05bpw -cs 131072 --max-batch-size 8 -chunk_size 8192 --port 30300
+gpus=1 container=glm53-2026-10-01-G066a-1g-stage2.6 image=sglang-exl3:dev mem=170g
+GLM53_EC_WARM=/w/glm53/data/stats_own_dec.json
+GLM53_ZC_VRAM=0
+GLM53_EC_RESERVE_GB=1.0
+GLM53_EC=1
+GLM53_EC_ELASTIC_GB=10
+GLM53_EC_STAGE_GB=2.6
+GLM53_EC_TIMING=1
+GLM53_ZC_STATS=/w/glm53/data/stats_own_dec.json
+EXLLAMAV3_TUNE_CACHE=/w/glm53/data/tune/coop_autotune_1gpu.bin
+TRITON_CACHE_DIR=/w/glm53/data/triton_cache_1gpu

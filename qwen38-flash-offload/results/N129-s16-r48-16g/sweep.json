@@ -1,0 +1,156 @@
+{
+ "card": "rtx3090",
+ "config": "HOM-272 s16_r48 GLM53_NV_PREFETCH=1 GLM53_NV_MARGIN_GB=1.5 GLM53_NV_PF_RING=128 GLM53_ARGS=-rcs 1 GLM53_NV_THREADS=48 GLM53_NV_PIECE_KB=1024",
+ "started": "2026-10-08T14:48:01+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "api": "sglang",
+ "served_model": null,
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {
+  "prefill_32768": 2848,
+  "decode_C1": 63.7
+ },
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 627.5,
+   "min": 624.5,
+   "max": 658.6,
+   "n": 3,
+   "all": [
+    627.5,
+    658.6,
+    624.5
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 12.905000000000001,
+    "min": 12.08,
+    "max": 13.73,
+    "n": 2,
+    "all": [
+     13.73,
+     12.08
+    ]
+   },
+   "per_stream_mean": {
+    "median": 12.895,
+    "min": 12.07,
+    "max": 13.72,
+    "n": 2,
+    "all": [
+     13.72,
+     12.07
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 13.73,
+     "per_stream_mean": 13.72,
+     "per_stream_min": 13.72,
+     "tokens": 1560,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 2.71,
+     "streams": [
+      {
+       "t0": 1919.283189521,
+       "first": 1921.996979771,
+       "last": 2035.61302147,
+       "tokens": 1560,
+       "finish": "stop",
+       "response": "# The History of the Printing Press\n\n## Introduction\n\nThe printing press stands as one of the most transformative inventions in human history. By enabling the mass production of texts, it revolutionized the spread of knowledge, accelerated cultural and scientific progress, and fundamentally reshaped societies across the globe. This account traces the development of printing from its earliest precursors through the invention of movable type, its rapid spread across Europe, and its lasting impact on the modern world.\n\n## Early Precursors Before Gutenberg\n\n### Printing in East Asia\n\nPrinting technology did not begin in Europe. The earliest known printed text is the **Diamond Sutra**, produced in China in 868 CE using woodblock printing, a technique in which text and images were carved into wooden blocks, inked, and pressed onto paper. Woodblock printing flourished in China, Korea, and Japan, particularly for Buddhist texts, calendars, and official documents.\n\nKorea made a crucial advance: **movable metal type**. The Jikji, a Buddhist text printed in 1377, is the oldest surviving book printed with movable metal type, predating Gutenberg's work by several decades. However, these innovations did not spread widely beyond East Asia, partly due to the enormous complexity of Chinese and Korean writing systems, which required thousands of distinct characters and made movable type less practical.\n\n### European Precursors\n\nIn Europe, several technologies laid the groundwork for printing:\n\n- **Woodcut printing** was used for images and short texts, such as playing cards and religious prints.\n- **Block books** combined images with brief text for devotional purposes.\n- **Papermaking**, transmitted from China through the Islamic world, had become established in Europe by the 13th and 14th centuries, providing an affordable medium for printed material.\n- **Rag-based paper mills** supplied the raw material that would make mass printing economically viable.\n\n## Gutenberg and the Invention of Movable Type in Europe\n\n### Johannes Gutenberg\n\nThe decisive breakthrough came in the mid-15th century in **Mainz, Germany**, through the work of **Johannes Gutenberg** (c. 1400\u20131468). A goldsmith by trade, Gutenberg combined several existing technologies with his own innovations to create a practical system of printing with movable type.\n\n### Key Innovations\n\nGutenberg's system was more than a single invention; it was an integrated process:\n\n1. **Movable metal type**: Individual letters cast in a durable metal alloy\u2014primarily lead, antimony, and tin\u2014could be arranged into pages, inked, printed, and then reused. Each letter was cast from a **matrix** using a hand mold, allowing the production of thousands of identical characters.\n\n2. **The hand mold**: This device enabled the rapid, consistent casting of type, a critical factor in making printing economically feasible.\n\n3. **Oil-based ink**: Unlike the water-based inks used for woodblocks, Gutenberg developed a viscous, oil-based ink that adhered well to metal type and transferred cleanly to paper.\n\n4. **Adapted press**: Gutenberg adapted the screw press, familiar from wine and olive oil production, to apply firm, even pressure across the printing surface, producing clear impressions far superior to simple rubbing.\n\n### The Gutenberg Bible\n\nAround **1455**, Gutenberg produced his masterpiece: the **Gutenberg Bible** (also called the 42-line Bible). Printed in Latin with approximately 180 copies, it demonstrated the commercial and artistic potential of the new technology. Its typography rivaled the quality of hand-copied manuscripts, helping to legitimize printed books in the eyes of contemporary scholars and clergy.\n\n### Financial Troubles\n\nDespite the technical success, Gutenberg's business ventures struggled. His financier, **Johann Fust**, eventually sued him, and Gutenberg lost much of his equipment and his share of the enterprise. He died in relative obscurity in 1468, though later generations would recognize him as the father of modern printing.\n\n## The Rapid Spread of Printing Across Europe\n\n### Expansion (1450s\u20131500)\n\nPrinting spread with remarkable speed:\n\n- **Italy**: Printing arrived in Subiaco (1465) and Venice (1469). Venice became Europe's printing capital, home to pioneering publishers such as **Aldus Manutius**, who introduced italic type and portable, affordable editions of classical texts.\n- **France**: Paris saw its first press around 1470.\n- **Spain, England, and beyond**: William Caxton established England's first press at Westminster in **1476**.\n- By **1500**, presses operated in more than 250 European cities, and an estimated **20 million books** had been printed\u2014more volumes than European scribes had produced in the previous thousand years.\n\n### The Incunabula Period\n\nBooks printed before 1501 are called **incunabula** (\"from the cradle\"). This era saw printers experiment with page layout, title pages, typefaces, and illustration techniques, gradually establishing the conventions of the modern book.\n\n## The Impact of the Printing Press\n\n### Religious Transformation\n\nThe press played a decisive role in the **Protestant Reformation**. Martin Luther's Ninety-Five Theses (1517) and his subsequent pamphlets spread across the Holy Roman Empire within weeks\u2014an impossibility in the manuscript age. Vernacular Bibles, including Luther's German translation, put scripture directly into the hands of laypeople and helped standardize national languages.\n\n### The Scientific Revolution\n\nPrint enabled the accurate, widespread dissemination of scientific observations, diagrams, and mathematical tables. Standardized editions of works by Copernicus, Vesalius, and Galileo allowed scholars across Europe to build on one another's findings, accelerating the Scientific Revolution.\n\n### Literacy, Language, and Culture\n\n- **Literacy rates** rose as books became cheaper and more abundant.\n- **Standardized languages** emerged as printed texts established consistent spelling and grammar, strengthening national and cultural identities.\n- **News culture** developed, with newspapers appearing in the early 17th century and creating an informed public sphere.\n- **Copyright concepts** began to take shape, as printers and authors sought protection for their works.\n\n### Political and Social Change\n\nPrinted pamphlets and broadsheets became instruments of political debate, contributing to movements such as the Enlightenment, the American and French Revolutions, and later reform campaigns. The press made it possible for ideas to challenge established authority on an unprecedented scale.\n\n## Later Developments in Printing Technology\n\n### The Industrial Revolution\n\n- **Steam-powered printing**: Friedrich Koenig's steam-driven press (1814) dramatically increased output, enabling mass-circulation newspapers.\n- **The rotary press**: Richard March Hoe's rotary press (1840s) used cylindrical plates for even faster printing.\n- **Linotype and Monotype** (late 19th century): These machines mechanized typesetting, replacing hand composition.\n\n### The 20th Century\n\n- **Offset lithography** became the dominant method for high-volume commercial printing.\n- **Phototypesetting** replaced metal type in the mid-20th century.\n- **Digital printing** and desktop publishing, emerging in the 1980s, democratized printing once again, allowing individuals to produce professional-quality documents from personal computers.\n\n## Conclusion\n\nFrom Gutenberg's workshop in Mainz to today's digital presses, printing has continuously evolved, yet the fundamental achievement remains the same: the democratization of knowledge. The printing press broke the elite's monopoly on the written word, empowered reformers and scientists, nurtured public opinion, and laid the technological and cultural foundations of the modern world. Few inventions have so profoundly altered the course of human civilization.",
+       "prompt_tokens": 26,
+       "prompt_sha256": "85bf2a887bb222f022d494dea653951821bbfde96264b7692b9cf1e088de2c97",
+       "delivered_timestamps": 1560
+      }
+     ]
+    },
+    {
+     "aggregate": 12.08,
+     "per_stream_mean": 12.07,
+     "per_stream_min": 12.07,
+     "tokens": 2254,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 2.46,
+     "streams": [
+      {
+       "t0": 2035.61476126,
+       "first": 2038.075639129,
+       "last": 2224.670019447,
+       "tokens": 2254,
+       "finish": "stop",
+       "response": "# TCP Congestion Control (Variant 100)\n\n## Overview\n\nTCP congestion control is a set of algorithms that prevent a sender from overwhelming the network. The core idea is that the sender maintains a **congestion window (cwnd)** \u2014 a limit on how many unacknowledged bytes it may have in flight \u2014 and adjusts this window dynamically based on signals from the network: packet loss, round-trip time (RTT) variations, and explicit congestion notifications.\n\nThe effective sending rate is governed by:\n\n```\nEffectiveWindow = min(cwnd, rwnd)\n```\n\nwhere `rwnd` is the receiver's advertised window (flow control). Congestion control is about protecting the *network*; flow control is about protecting the *receiver*.\n\n---\n\n## Core State Variables\n\n| Variable | Meaning |\n|---|---|\n| **cwnd** | Congestion window \u2014 sender's estimate of safe in-flight data |\n| **ssthresh** | Slow start threshold \u2014 boundary between slow start and congestion avoidance |\n| **RTO** | Retransmission timeout, derived from smoothed RTT and RTT variance |\n| **FlightSize** | Bytes sent but not yet acknowledged |\n| **DupAcks** | Count of duplicate ACKs received |\n\n---\n\n## Phase 1: Slow Start\n\nDespite its name, slow start grows *exponentially* \u2014 it starts slowly but ramps up quickly.\n\n- **Initialization:** `cwnd = IW` (initial window, typically 10 MSS in modern stacks; historically 1\u20134 MSS).\n- **Mechanism:** For every ACK received, increase cwnd by one segment:\n\n```\ncwnd += MSS   (per ACK)\n```\n\nSince ACKs arrive roughly once per RTT for each segment sent, cwnd approximately **doubles every RTT**.\n\n- **Exit conditions:**\n  1. `cwnd \u2265 ssthresh` \u2192 transition to congestion avoidance.\n  2. Packet loss detected \u2192 transition to loss response (see below).\n  3. cwnd reaches a configured maximum.\n\n**Purpose:** Slow start probes available bandwidth cautiously at first, avoiding an immediate burst that could collapse an already-congested network. It also serves to \"prime the pump\" \u2014 filling the network path's buffers and learning the path's capacity.\n\n---\n\n## Phase 2: Congestion Avoidance\n\nOnce cwnd reaches ssthresh, exponential growth becomes too aggressive. Congestion avoidance grows the window **linearly** \u2014 roughly one MSS per RTT:\n\n```\ncwnd += MSS \u00d7 (MSS / cwnd)   (per ACK)\n```\n\nThis is often implemented as `cwnd += MSS/MSS` per ACK with fractional accumulation, or simply \"increase cwnd by one segment per RTT.\"\n\n**Rationale:** Additive increase is gentle enough to avoid inducing congestion when the sender is near capacity, while still probing for newly available bandwidth.\n\n---\n\n## Loss Detection and Response\n\nTCP detects congestion through two mechanisms:\n\n### 1. Timeout (RTO expiry)\n\nA timeout means the network is likely in **severe congestion** \u2014 even duplicate ACKs aren't arriving. The response is drastic:\n\n```\nssthresh = max(FlightSize / 2, 2 \u00d7 MSS)\ncwnd     = IW          (restart slow start)\n```\n\nThis is **Multiplicative Decrease**. The connection essentially resets its congestion window and re-enters slow start.\n\n### 2. Fast Retransmit / Fast Recovery (three duplicate ACKs)\n\nThree duplicate ACKs indicate a single lost segment (subsequent segments still triggered ACKs). The network is still delivering packets, so congestion is *moderate*:\n\n- **Fast Retransmit:** Resend the segment the dup-ACKs point to, without waiting for the RTO.\n- **Fast Recovery:** Upon entering fast recovery:\n\n```\nssthresh = max(FlightSize / 2, 2 \u00d7 MSS)\ncwnd     = ssthresh + 3 \u00d7 MSS   (inflate for dup-ACKs already in flight)\n```\n\nEach additional dup-ACK inflates cwnd by one MSS (they represent a segment leaving the network). When an ACK for the retransmitted (and any previously missing) data arrives \u2014 a \"new ACK\" \u2014 deflation occurs:\n\n```\ncwnd = ssthresh\n```\n\nThe sender then enters **congestion avoidance** directly, skipping slow start. This combined behavior is called **AIMD (Additive Increase, Multiplicative Decrease)** and is the classical TCP congestion control paradigm.\n\n---\n\n## Classic Variants\n\n### TCP Tahoe\n- Implements slow start, congestion avoidance, and fast retransmit.\n- On *any* loss (timeout **or** triple dup-ACK): sets ssthresh to half FlightSize and **resets cwnd to IW**, re-entering slow start.\n\n### TCP Reno\n- Adds **fast recovery**: after a triple dup-ACK, halves cwnd and continues in congestion avoidance rather than restarting.\n- Weakness: **multiple losses in one window** cause the \"pipe to drain\" \u2014 the recovery ACK arrives before all losses are repaired, forcing a timeout.\n\n### TCP NewReno\n- Fixes Reno's multiple-loss problem using **partial ACKs**: during fast recovery, an ACK that covers less than all data outstanding at recovery entry is treated as a partial ACK. It triggers retransmission of the *next* missing segment and keeps the sender in fast recovery until the ACK covers everything sent at recovery entry.\n\n### TCP SACK (Selective Acknowledgment)\n- Uses the SACK TCP option to tell the sender exactly which non-contiguous blocks were received.\n- The sender maintains a scoreboard and can retransmit multiple losses in one window efficiently, without relying on dup-ACK counting or partial ACK heuristics.\n\n---\n\n## Modern Variants\n\n### CUBIC (default in Linux)\n- Window growth is a **cubic function of time since the last congestion event**:\n\n```\nW(t) = C(t \u2212 K)\u00b3 + W_max\n```\n\nwhere `W_max` is the window at the last loss, `C` is a scaling constant, and `K` is the time to reach `W_max`.\n- After a loss, cwnd drops to ~0.7 \u00d7 W_max, then grows cubically: slowly at first (stability near the previous operating point), then rapidly (fast probing for new capacity).\n- **Hybrid slow start** replaces naive slow start with a mechanism that exits early based on ACK pacing and RTT samples.\n- Designed for **high-bandwidth, long-delay (high BDP)** networks; it is RTT-fair within a bottleneck but scales well across RTTs.\n\n### BBR (Bottleneck Bandwidth and RTT)\n- **Model-based rather than loss-based.** It explicitly estimates:\n  - **BtlBw** \u2014 the bottleneck bandwidth (max delivery rate observed over a sliding window)\n  - **RTprop** \u2014 the minimum RTT observed over a sliding window (~10 s)\n- Computes the **BDP = BtlBw \u00d7 RTprop** and sets cwnd to a small multiple (typically 2\u00d7) of BDP.\n- Cycles through states: **STARTUP** (exponential probe, like slow start), **DRAIN** (empty queues built during startup), **PROBE_BW** (steady state, periodically raising pacing rate by ~25% to re-probe bandwidth), and **PROBE_RTT** (briefly reduce inflight to refresh RTprop).\n- Avoids filling bottleneck queues, so it achieves high throughput with **low queueing delay** \u2014 unlike loss-based algorithms that \"fill the buffer\" until loss occurs (bufferbloat).\n- Caveat: BBR (v1) can be unfair to loss-based flows sharing a shallow buffer, since it doesn't react to loss as a congestion signal.\n\n### DCTCP / ECN-based control\n- Uses **Explicit Congestion Notification**: routers mark packets (CE bit) as queues build, *before* loss.\n- The sender tracks the fraction of marked ACKs per window and adjusts cwnd multiplicatively by that fraction:\n\n```\ncwnd \u00d7 (1 \u2212 \u03b1/2),  where \u03b1 = smoothed fraction of ECN-marked packets\n```\n\n- Designed for data centers with shallow buffers; yields very low queue occupancy and high throughput simultaneously.\n\n---\n\n## Supporting Mechanisms\n\n### Round-Trip Time Estimation\n```\nSRTT   = (1 \u2212 \u03b1)\u00b7SRTT + \u03b1\u00b7RTT_sample        (\u03b1 typically 1/8)\nRTTVAR = (1 \u2212 \u03b2)\u00b7RTTVAR + \u03b2\u00b7|SRTT \u2212 sample|  (\u03b2 typically 1/4)\nRTO    = SRTT + 4 \u00d7 RTTVAR\n```\nKarn's algorithm: RTT samples from retransmitted segments are discarded (ambiguity between original and retransmission).\n\n### Pacing\nModern stacks pace packets evenly across the RTT rather than sending a full window in a burst (\"packet trains\"), reducing burst-induced loss and queueing. Pacing is now integral to CUBIC and BBR operation.\n\n### Window Validation & App-Limited Behavior\nWhen the application sends less than cwnd allows, the sender cannot infer network capacity from ACKs. Implementations avoid growing cwnd (or decay it) during long idle/app-limited periods, preventing stale windows from bursting into a changed network.\n\n---\n\n## Fairness and Convergence\n\n- **AIMD convergence:** Additive increase + multiplicative decrease provably converges to fair sharing of a bottleneck between competing AIMD flows (the classic Chiu\u2013Jain result).\n- **RTT unfairness:** Loss-based AIMD gives shorter-RTT flows an advantage \u2014 they increase at the same *rate per RTT* but cycle faster, grabbing more bandwidth.\n- **Loss-based vs. delay-based coexistence:** Loss-based flows (Reno/CUBIC) fill buffers; delay-based flows (Vegas, BBR) keep queues short. When mixed, loss-based flows can push queues deep enough that delay-based flows back off excessively \u2014 an ongoing area of tuning (addressed partially by BBRv2/v3).\n\n---\n\n## Summary of the Control Loop\n\n1. **Probe:** Grow cwnd (slow start \u2192 congestion avoidance) to find available capacity.\n2. **Signal:** Congestion manifests as loss (implicit) or ECN marks (explicit).\n3. **React:** Halve the window (multiplicative decrease) on congestion; restart from IW on timeout.\n4. **Repeat:** The sawtooth behavior \u2014 steady additive growth punctuated by multiplicative drops \u2014 keeps aggregate load near, but not catastrophically over, network capacity.\n\nThis distributed, end-to-end feedback loop requires no router cooperation (except in ECN variants), which is precisely why TCP congestion control has scaled across the Internet for decades.",
+       "prompt_tokens": 25,
+       "prompt_sha256": "9e585606b22299b5a4729e202d5dfe8d5266ff44703c5ae7fd166fea51757daf",
+       "delivered_timestamps": 2254
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "marks": [
+  {
+   "phase": "prefill_8k",
+   "t0": 1791463691.98078,
+   "t1": 1791463730.6028273
+  },
+  {
+   "phase": "decode_C1",
+   "t0": 1791463730.603081,
+   "t1": 1791464036.320049
+  }
+ ],
+ "prompt_seed": 1791463681,
+ "prefill_prompt_receipts": [
+  {
+   "tokens": 8192,
+   "rep": 0,
+   "prompt_sha256": "f9430b61b24b2aeb67e9d715e92a1173e0d31ad944922dba913b52d228450376",
+   "ttft_s": 13.054284214000063
+  },
+  {
+   "tokens": 8192,
+   "rep": 1,
+   "prompt_sha256": "74b6bd293e3a5aa03726cfda139a481207f3b6e2cc77dc152df32548717eb13c",
+   "ttft_s": 12.43797615199992
+  },
+  {
+   "tokens": 8192,
+   "rep": 2,
+   "prompt_sha256": "b472351a460a136324a87667a99abd2d4ed1287a03b63aafba9ba39fa9b635ca",
+   "ttft_s": 13.116900071999908
+  }
+ ],
+ "gates": {
+  "prefill_8192": {
+   "value": 627.5,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 12.91,
+   "best_known": 63.7,
+   "pass": false
+  }
+ },
+ "finished": "2026-10-08T14:53:56+0200"
+}

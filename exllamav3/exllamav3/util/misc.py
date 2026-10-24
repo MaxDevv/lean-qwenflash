@@ -1,0 +1,281 @@
+import math
+import threading
+import time
+import torch
+import socket, contextlib
+import weakref
+import re
+
+lock = threading.RLock()
+
+def synchronized(func):
+    def wrapper(*args, **kwargs):
+        with lock:
+            return func(*args, **kwargs)
+    return wrapper
+
+def align_to(value, alignment):
+    return int(math.ceil(value / alignment) * alignment)
+
+
+class Timer:
+    """
+    Context manager to record duration
+    """
+
+    def __enter__(self):
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.end_time = time.time()
+        self.interval = self.end_time - self.start_time
+
+
+def cuda_sync_active():
+    """
+    Calling torch.cuda.synchronize() will create a CUDA context on CUDA:0 even if that device is not being used.
+    This function synchronizes only devices actively used by Torch in the current process.
+    """
+    for device_id in range(torch.cuda.device_count()):
+        device = torch.device(f'cuda:{device_id}')
+        if torch.cuda.memory_allocated(device) > 0:
+            torch.cuda.synchronize(device)
+
+
+def next_power_of_2(x):
+    return 1 if x == 0 else 2**(x - 1).bit_length()
+
+
+def human_time(seconds: float) -> str:
+    seconds = round(seconds)
+    minutes = seconds // 60
+    hours = minutes // 60
+    minutes -= hours * 60
+    if hours:
+        if minutes:
+            hs = "s" if hours > 1 else ""
+            ms = "s" if minutes > 1 else ""
+            return f"{hours} hour{hs}, {minutes} minute{ms}"
+        else:
+            hs = "s" if hours > 1 else ""
+            return f"{hours} hour{hs}"
+    elif minutes:
+        ms = "s" if minutes > 1 else ""
+        return f"{minutes} minute{ms}"
+    else:
+        return f"< 1 minute"
+
+
+def first_not_none(*values):
+    return next((v for v in values if v is not None), None)
+
+
+def ratio_split(d, weights, chunk_size = 128):
+    assert d % chunk_size == 0, "Total must be divisible by chunk size"
+    total_chunks = d // chunk_size
+    total_weight = sum(weights)
+    ideal_chunks = [total_chunks * w / total_weight for w in weights]
+    base_chunks = [int(c) for c in ideal_chunks]
+    remainder = total_chunks - sum(base_chunks)
+    residuals = [c - int(c) for c in ideal_chunks]
+    for i in sorted(range(len(residuals)), key = lambda i: -residuals[i])[:remainder]:
+        base_chunks[i] += 1
+    final_alloc = [c * chunk_size for c in base_chunks]
+    assert sum(final_alloc) == d
+    return final_alloc
+
+
+def find_free_port() -> int:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+class Cleanupper:
+    """
+    Utility class to call cleanup functions at the end of the __main__ scope. Similar functionality to
+    atexit but called before Python starts tearing down objects/threads.
+    """
+
+    def __init__(self):
+        self.atexit_fns = []
+        weakref.finalize(self, self._shutdown)
+
+    def register_atexit(self, fn):
+        self.atexit_fns.append(fn)
+
+    def unregister_atexit(self, fn):
+        if fn in self.atexit_fns:
+            self.atexit_fns.remove(fn)
+
+    def _shutdown(self):
+        # Snapshot first: hooks commonly unregister themselves when called, and mutating the
+        # list mid-iteration would skip the next entry
+        fns, self.atexit_fns = self.atexit_fns, []
+        for fn in fns:
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+
+def install_parent_death_signal() -> bool:
+    """
+    On Linux, ask the kernel to terminate this worker if its direct parent dies.
+    This is a best-effort safety net for cases where Python shutdown hooks do not
+    get a chance to clean up spawned workers.
+    """
+    import sys, os
+    if sys.platform != "linux":
+        return False
+
+    import ctypes
+    import signal
+
+    PR_SET_PDEATHSIG = 1
+    parent_pid = os.getppid()
+
+    libc = ctypes.CDLL("libc.so.6", use_errno = True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
+        return False
+
+    # Race check: the parent may have exited before PDEATHSIG was installed.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    return True
+
+
+def set_process_priority_and_affinity():
+    import psutil, os
+    import multiprocessing as mp
+
+    p = psutil.Process(os.getpid())
+    # Try to bump priority slightly. May need sudo (?)
+    try:
+        p.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS if os.name == "nt" else -5)
+    except PermissionError:
+        pass
+    except Exception as e:
+        pass
+
+    # Pin to a core
+    # TODO: Pick an idle core automatically?
+    try:
+        p.cpu_affinity([0])  # pick an isolated/quiet core if possible
+    except AttributeError:
+        pass
+    except Exception as e:
+        pass
+
+
+def parse_int_list(
+    spec: str,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> list[int]:
+    """
+    Parse a command-line integer list specification.
+
+    Supported forms:
+        "1,2,3"                 -> [1, 2, 3]
+        "1..4"                  -> [1, 2, 3, 4]
+        "4..1"                  -> [4, 3, 2, 1]
+        "..4"                   -> [min_value..4]
+        "4.."                   -> [4..max_value]
+        "..,.."                 -> [min_value..max_value, min_value..max_value]
+        "..15,11..15,11.."      -> [min_value..15, 11..15, 11..max_value]
+
+    Ranges are inclusive.
+    Whitespace is ignored around items.
+
+    Open-ended ranges require min_value or max_value.
+    """
+
+    if not spec.strip():
+        return []
+
+    result: list[int] = []
+    int_pattern = r"[+-]?\d+"
+
+    for part in spec.split(","):
+        part = part.strip()
+
+        if not part:
+            raise ValueError(f"Empty item in integer list: {spec!r}")
+
+        if re.fullmatch(int_pattern, part):
+            result.append(int(part))
+            continue
+
+        match = re.fullmatch(
+            rf"({int_pattern})?\s*\.\.\s*({int_pattern})?",
+            part,
+        )
+
+        if not match:
+            raise ValueError(f"Invalid integer list item: {part!r}")
+
+        start_text, end_text = match.groups()
+
+        if start_text is None and end_text is None:
+            if min_value is None or max_value is None:
+                raise ValueError(f"Range {part!r} requires both min_value and max_value")
+            start = min_value
+            end = max_value
+        else:
+            if start_text is None:
+                if min_value is None:
+                    raise ValueError(f"Open-ended range {part!r} requires min_value")
+                start = min_value
+            else:
+                start = int(start_text)
+
+            if end_text is None:
+                if max_value is None:
+                    raise ValueError(f"Open-ended range {part!r} requires max_value")
+                end = max_value
+            else:
+                end = int(end_text)
+
+        step = 1 if end >= start else -1
+        result.extend(range(start, end + step, step))
+
+    return result
+
+
+def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor, mode: str = "generation",
+                            prompt: str = "Say something."):
+    """
+    mode "generation": context ends at the bare generation prompt (e.g. "<|start|>assistant"),
+    so appended raw text sits where a role/channel header belongs -- badly out of distribution
+    for structured-format models (gpt-oss harmony expects "<|channel|>" next with near
+    certainty). mode "assistant": renders an unterminated empty assistant message instead
+    (continue_final_message), so the appended text lands at message-content position (gpt-oss:
+    "...assistant<|channel|>final<|message|>"); equivalent to "generation" for plain templates.
+    """
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": prompt},
+    ]
+    if mode == "assistant":
+        prefix = tokenizer.hf_chat_template(
+            messages + [{"role": "assistant", "content": ""}],
+            add_special_tokens = True,
+            add_generation_prompt = False,
+            continue_final_message = True,
+            return_tensors = "pt"
+        )
+    else:
+        prefix = tokenizer.hf_chat_template(
+            messages,
+            add_special_tokens = True,
+            add_generation_prompt = True,
+            return_tensors = "pt"
+        )
+    prefix = prefix.repeat(tokens.shape[0], 1)
+    tokens = torch.cat((prefix, tokens), dim = -1)
+    return tokens

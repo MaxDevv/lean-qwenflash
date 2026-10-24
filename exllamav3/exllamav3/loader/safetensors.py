@@ -1,0 +1,1274 @@
+from __future__ import annotations
+
+import re
+import math
+from dataclasses import dataclass
+import torch
+import os, glob
+import numpy as np
+import json
+import itertools
+from ..util import Timer
+from ..ext import exllamav3_ext as ext
+from functools import cached_property
+import time
+
+MAX_DEFERRED_LOAD_CHUNK = 4*1024**2
+
+# Row layout and flags for ext.stloader_deferred_batch (mirrors StloaderBatchColumn in stloader.h)
+_COL_FILE, _COL_OFFSET, _COL_SIZE, _COL_DEST, _COL_DEST_SIZE, _COL_FLAGS, _COL_DEVICE = range(7)
+_NUM_COLS = 7
+_FLAG_BF16_TO_FP16 = 1
+_FLAG_FP32_TO_FP16 = 2
+_FLAG_CUDA = 4
+
+# Shared EXL3 codebook marker tensors, by value (see SafetensorsCollection.get_codebook_marker)
+_codebook_markers = {}
+if MAX_DEFERRED_LOAD_CHUNK % 2:
+    raise ValueError("MAX_DEFERRED_LOAD_CHUNK must be even")
+
+# The safetensors format puts no limit on the header, but the reference implementation caps it at
+# 100 MB. The length is read straight off disk, so it has to be bounded before it reaches fp.read().
+MAX_HEADER_SIZE = 100 * 1024**2
+
+
+def convert_dtype(dt: str):
+    """
+    Map safetensors dtype tag to (torch dtype, numpy dtype, element size in bytes).
+
+    The numpy dtype is None for types numpy cannot represent (bf16, fp8). Nothing currently uses
+    the field, and a same-width stand-in would silently reinterpret the bits rather than convert
+    them, so it is left unset instead.
+    """
+    if dt == "I32": return torch.int, np.int32, 4
+    elif dt == "I64": return torch.long, np.int64, 8
+    elif dt == "I8": return torch.int8, np.int8, 1
+    elif dt == "F8_E8M0": return torch.uint8, None, 1
+    elif dt == "I16": return torch.short, np.int16, 2
+    elif dt == "F16": return torch.float16, np.float16, 2
+    elif dt == "BF16": return torch.bfloat16, None, 2
+    elif dt == "F32": return torch.float, np.float32, 4
+    elif dt == "F8_E4M3": return torch.float8_e4m3fn, None, 1
+    elif dt == "U8": return torch.uint8, np.uint8, 1
+    else:
+        raise ValueError(f"Unknown dtype {dt}")
+
+
+def validate_header(header: dict, filename: str, data_offset: int, file_size: int):
+    """
+    Check every entry in a safetensors header before any of it is used to size an allocation or to
+    seek in the file. Shapes and offsets are attacker-controlled if the model is, and they end up
+    as raw pointers and lengths in the C++ loader, so nothing here is assumed to be sane.
+
+    Entries with a dtype the loader doesn't handle are structurally validated but not size-checked;
+    checkpoints routinely carry buffers in dtypes exllamav3 never reads (I64 and friends), and
+    those only need to fail if something actually asks for them.
+    """
+    metadata = header.get("__metadata__")
+    if metadata is not None and not (
+        isinstance(metadata, dict) and
+        all(isinstance(k, str) and isinstance(v, str) for k, v in metadata.items())
+    ):
+        raise ValueError(f"Invalid __metadata__ in {filename}: must be a string -> string map")
+
+    # bool is an int subclass, and a shape or offset of True would sail through arithmetic
+    def is_int(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+
+    for key, h in header.items():
+        if key == "__metadata__":
+            continue
+
+        if not isinstance(h, dict):
+            raise ValueError(f"Invalid entry for {key} in {filename}: must be a JSON object")
+
+        shape = h.get("shape")
+        if not (isinstance(shape, list) and all(is_int(s) and s >= 0 for s in shape)):
+            raise ValueError(f"Invalid shape for {key} in {filename}: {shape}")
+
+        offsets = h.get("data_offsets")
+        if not (isinstance(offsets, list) and len(offsets) == 2 and all(is_int(o) for o in offsets)):
+            raise ValueError(f"Invalid data_offsets for {key} in {filename}: {offsets}")
+
+        beg, end = offsets
+        if not 0 <= beg <= end:
+            raise ValueError(f"Invalid data_offsets for {key} in {filename}: {offsets}")
+
+        if data_offset + end > file_size:
+            raise ValueError(
+                f"Tensor {key} in {filename} extends past end of file: needs "
+                f"{data_offset + end} bytes, file is {file_size} bytes"
+            )
+
+        try:
+            _, _, esize = convert_dtype(h.get("dtype"))
+        except ValueError:
+            continue
+
+        # Ties the declared byte range to the tensor that will be allocated for it. Without this a
+        # header can ask for a large read into a small tensor.
+        expected = math.prod(shape) * esize
+        if end - beg != expected:
+            raise ValueError(
+                f"Size mismatch for {key} in {filename}: data_offsets span {end - beg} bytes, "
+                f"shape {shape} of {h['dtype']} is {expected} bytes"
+            )
+
+
+def read_header(filename: str, tensor_name_fixes: dict | None) -> dict:
+    file_size = os.path.getsize(filename)
+    if file_size < 8:
+        raise ValueError(f"{filename} is too small to be a safetensors file")
+
+    with open(filename, "rb") as fp:
+        header_size = int(np.frombuffer(fp.read(8), dtype = np.int64)[0])
+
+        # header_size is a signed 64-bit value straight off disk. Negative would turn the read
+        # below into "read the whole file", and an absurd positive value into one huge allocation,
+        # so it is bounded before it is used.
+        if not 0 < header_size <= MAX_HEADER_SIZE:
+            raise ValueError(
+                f"Invalid safetensors header size in {filename}: {header_size} "
+                f"(must be 1..{MAX_HEADER_SIZE})"
+            )
+        if 8 + header_size > file_size:
+            raise ValueError(
+                f"Truncated safetensors header in {filename}: header claims {header_size} bytes, "
+                f"file is {file_size} bytes"
+            )
+
+        header_json = fp.read(header_size)
+
+    # fp.read() can come up short without raising, which would shift the data offset below and
+    # silently misplace every tensor in the file. json.loads then pins the content length from the
+    # other side: it rejects both a truncated object and trailing bytes past the end of the JSON.
+    if len(header_json) != header_size:
+        raise ValueError(
+            f"Truncated safetensors header in {filename}: wanted {header_size} bytes, "
+            f"got {len(header_json)}"
+        )
+
+    header = json.loads(header_json.decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError(f"Invalid safetensors header in {filename}: not a JSON object")
+
+    data_offset = 8 + header_size
+    validate_header(header, filename, data_offset, file_size)
+
+    if tensor_name_fixes:
+        bad_keys = []
+        for k, v in header.items():
+            for k_, v_ in tensor_name_fixes.items():
+                if k.endswith(k_):
+                    bad_keys.append((k, k[:-len(k_)] + v_, v))
+        for k, k_, v in bad_keys:
+            del header[k]
+            header[k_] = v
+
+    # Set last, so neither a tensor of the same name nor a rename rule ending in it can land on
+    # the key the data offset is read back from
+    header["_header_offset"] = data_offset
+    return header
+
+
+@dataclass
+class STCMetrics:
+    bytes_loaded: int = 0
+    time_elapsed: float = 0.0
+    total_open_elapsed: float = 0.0
+    deferred_tensors: int = 0
+    deferred_passes: int = 0
+    direct_tensors: int = 0
+    total_chunks: int = 0
+    def bandwidth_total(self):
+        return self.bytes_loaded / (1024 ** 3) / (self.total_open_elapsed + 1e-8)
+    def bandwidth(self):
+        return self.bytes_loaded / (1024 ** 3) / (self.time_elapsed + 1e-8)
+    def print(self):
+        print(f" -- Total size: {self.bytes_loaded:,} bytes, {self.bytes_loaded / 1024**3:.2f} GB")
+        print(f" -- Load time: {self.time_elapsed:.3f} seconds")
+        print(f" -- Overhead: {self.total_open_elapsed - self.time_elapsed:.3f} seconds")
+        print(f" -- Bandwidth: {self.bandwidth():.3f} GB/s  /  {self.bandwidth_total():.3f} GB/s")
+        print(f" -- Deferred: {self.deferred_tensors:,} tensors in {self.deferred_passes:,} passes, {self.total_chunks:,} chunks")
+        print(f" -- Direct: {self.direct_tensors:,} tensors")
+
+
+# Windows positioned reads. DiskTensorHandle opens Win32 HANDLEs with FILE_FLAG_OVERLAPPED, where
+# every ReadFile carries its own offset in the OVERLAPPED (the pread equivalent). C++ gather
+# (ngram_gather_win.cpp) can additionally leave many reads in flight on the same handle, which is
+# where the streamed n-gram path gets its queue depth. The persistent streaming handle is also
+# unbuffered, the reference-read handles transient and buffered.
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes as _wt
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    # HANDLEs travel as c_ssize_t so INVALID_HANDLE_VALUE compares as -1 and the value passes to
+    # the extension as a plain int
+    _k32.CreateFileW.argtypes = [_wt.LPCWSTR, _wt.DWORD, _wt.DWORD, ctypes.c_void_p, _wt.DWORD,
+                                 _wt.DWORD, ctypes.c_void_p]
+    _k32.CreateFileW.restype = ctypes.c_ssize_t
+    _k32.ReadFile.argtypes = [ctypes.c_ssize_t, ctypes.c_void_p, _wt.DWORD, ctypes.c_void_p,
+                              ctypes.c_void_p]
+    _k32.ReadFile.restype = _wt.BOOL
+    _k32.GetOverlappedResult.argtypes = [ctypes.c_ssize_t, ctypes.c_void_p,
+                                         ctypes.POINTER(_wt.DWORD), _wt.BOOL]
+    _k32.GetOverlappedResult.restype = _wt.BOOL
+    _k32.CreateEventW.argtypes = [ctypes.c_void_p, _wt.BOOL, _wt.BOOL, _wt.LPCWSTR]
+    _k32.CreateEventW.restype = ctypes.c_ssize_t
+    _k32.CloseHandle.argtypes = [ctypes.c_ssize_t]
+    _k32.CloseHandle.restype = _wt.BOOL
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("Offset", _wt.DWORD),
+            ("OffsetHigh", _wt.DWORD),
+            ("hEvent", ctypes.c_ssize_t),
+        ]
+
+    def _win_open(filename: str, flags: int) -> int:
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_ALL = 0x00000007            # READ | WRITE | DELETE, like os.open on Windows
+        OPEN_EXISTING = 3
+        h = _k32.CreateFileW(filename, GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING,
+                             flags, None)
+        if h == -1:
+            raise OSError(f"CreateFileW failed for {filename} (error {ctypes.get_last_error()})")
+        return h
+
+    def _win_open_stream(filename: str) -> int:
+        # The persistent streaming handle: overlapped (positioned, many reads in flight) and
+        # unbuffered.
+        FILE_FLAG_OVERLAPPED = 0x40000000
+        FILE_FLAG_NO_BUFFERING = 0x20000000
+        return _win_open(filename, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING)
+
+    def _win_open_ref(filename: str) -> int:
+        # Transient handle for the Python reference reads: buffered (arbitrary offsets), opened
+        # per call and closed immediately so it never sustains a cache map on the file
+        return _win_open(filename, 0x40000000)
+
+    def _win_pread_into(handle: int, mv: memoryview, offset: int) -> int:
+        """pread equivalent for an overlapped HANDLE: positioned read into a writable memoryview,
+        thread-safe (the offset travels in the OVERLAPPED, not in handle state). May return
+        short, like pread."""
+        ev = _k32.CreateEventW(None, True, False, None)
+        if ev in (0, -1):
+            raise OSError(f"CreateEventW failed (error {ctypes.get_last_error()})")
+        try:
+            ov = _OVERLAPPED()
+            ov.Offset = offset & 0xffffffff
+            ov.OffsetHigh = (offset >> 32) & 0xffffffff
+            ov.hEvent = ev
+            n = len(mv)
+            dst = (ctypes.c_char * n).from_buffer(mv)
+            got = _wt.DWORD(0)
+            ok = _k32.ReadFile(handle, dst, n, None, ctypes.byref(ov))
+            if not ok and ctypes.get_last_error() != 997:   # ERROR_IO_PENDING
+                raise OSError(f"ReadFile failed (error {ctypes.get_last_error()})")
+            if not _k32.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(got), True):
+                raise OSError(f"overlapped read failed (error {ctypes.get_last_error()})")
+            return got.value
+        finally:
+            _k32.CloseHandle(ev)
+
+
+class DiskTensorHandle:
+    """
+    Handle to a tensor that stays on disk: full shape/dtype metadata plus the file location, with
+    on-demand row reads. Returned by SafetensorsCollection.get_tensor_handle() so modules can
+    stream rows of very large tensors (e.g. hashed n-gram embedding tables) instead of loading
+    them. Reads are positioned and thread-safe: pread on a shared fd (Linux), ReadFile with
+    per-call OVERLAPPED offsets on a shared overlapped HANDLE (Windows).
+    """
+
+    def __init__(self, key: str, filename: str, abs_offset: int, shape: list, dtype: torch.dtype):
+        assert len(shape) >= 1
+        self.key = key
+        self.filename = filename
+        self.abs_offset = abs_offset
+        self.shape = list(shape)
+        self.dtype = dtype
+        esize = torch.empty(0, dtype = dtype).element_size()
+        self.num_rows = shape[0]
+        self.row_shape = list(shape[1:])
+        self.row_bytes = math.prod(shape[1:]) * esize if len(shape) > 1 else esize
+        self.fd = None
+
+    def _ensure_open(self):
+        if self.fd is None:
+            if os.name == "nt":
+                # overlapped + unbuffered HANDLE as an int; ngram_gather_cpu takes it in place
+                # of an fd and requires exactly these flags (it reads sector-aligned spans)
+                self.fd = _win_open_stream(self.filename)
+            else:
+                self.fd = os.open(self.filename, os.O_RDONLY)
+        return self.fd
+
+    def close(self):
+        if self.fd is not None:
+            if os.name == "nt":
+                _k32.CloseHandle(self.fd)
+            else:
+                os.close(self.fd)
+            self.fd = None
+
+    def _ref_fd(self):
+        # Reference reads on Windows go through a transient handle, not self.fd: buffered reads
+        # on a long-lived file object leave a live cache map on the file, which serializes the
+        # unbuffered fast-path gathers at ~QD 1 for as long as the file object stays open (see
+        # ngram_gather_win.cpp). A transient object's map dies shortly after close.
+        if os.name == "nt":
+            return _win_open_ref(self.filename), True
+        return self._ensure_open(), False
+
+    @staticmethod
+    def _ref_fd_close(fd, transient):
+        if transient:
+            _k32.CloseHandle(fd)
+
+    def read_range(self, start: int, end: int) -> torch.Tensor:
+        """Contiguous rows [start, end) as a CPU tensor in the stored dtype."""
+        assert 0 <= start <= end <= self.num_rows
+        fd, transient = self._ref_fd()
+        nbytes = (end - start) * self.row_bytes
+        buf = bytearray(nbytes)
+        mv = memoryview(buf)
+        pos = 0
+        base = self.abs_offset + start * self.row_bytes
+        try:
+            while pos < nbytes:
+                if os.name == "nt":
+                    got = _win_pread_into(fd, mv[pos:], base + pos)
+                else:
+                    got = os.preadv(fd, [mv[pos:]], base + pos)
+                assert got > 0, f"short read from {self.filename}"
+                pos += got
+        finally:
+            self._ref_fd_close(fd, transient)
+        return torch.frombuffer(buf, dtype = self.dtype).view(end - start, *self.row_shape)
+
+    def read_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Gather of arbitrary rows, returned in the order given, as a CPU tensor in the stored
+        dtype. Adjacent sorted indices are coalesced into single reads.
+        """
+        idx = indices.reshape(-1).cpu().to(torch.int64)
+        n = idx.numel()
+        out = torch.empty((n, *self.row_shape), dtype = self.dtype)
+        if n == 0:
+            return out
+        fd, transient = self._ref_fd()
+        order = torch.argsort(idx)
+        sidx = idx[order].tolist()
+        out_flat = out.view(n, -1)
+        rb = self.row_bytes
+        run_start = 0
+        j = 0
+        try:
+            while j < n:
+                # extend run while file rows stay consecutive
+                k = j + 1
+                while k < n and sidx[k] == sidx[k - 1] + 1:
+                    k += 1
+                nbytes = (k - j) * rb
+                if os.name == "nt":
+                    buf = bytearray(nbytes)
+                    got = _win_pread_into(fd, memoryview(buf), self.abs_offset + sidx[j] * rb)
+                    assert got == nbytes, f"short read from {self.filename}"
+                else:
+                    buf = bytearray(os.pread(fd, nbytes, self.abs_offset + sidx[j] * rb))
+                    assert len(buf) == nbytes, f"short read from {self.filename}"
+                rows = torch.frombuffer(buf, dtype = self.dtype).view(k - j, -1)
+                out_flat[order[j:k]] = rows
+                j = k
+        finally:
+            self._ref_fd_close(fd, transient)
+        return out
+
+
+class SafetensorsCollection:
+
+    def __init__(
+        self,
+        directory: str,
+        load_method: str | None = None,
+        tensor_name_fixes: dict | None = None,
+    ):
+        """
+        Scan directory for .safetensors files and build collection, preparing to load tensors indexed by key.
+
+        :param directory:
+            Directory to scan.
+
+        :param load_method:
+            - "mt_fread": multithreaded C++ loader using fread
+            - "python": use fp.seek() and fp.read() to load tensor data via bytearray and torch.frombuffer
+        """
+
+        self.directory = directory
+        self.tensor_file_map = {}
+        self.file_headers = {}
+        self.handles: dict[str, list | None] = {}
+        self.load_method = load_method or "mt_fread"
+        self.tensor_name_fixes = tensor_name_fixes or {}
+
+        self.metrics = STCMetrics()
+        self.first_open_time = None
+        self.disk_handles = []
+        self.checked_markers = set()
+
+        self.tensor_files = []
+        self.add_tensor_files(directory)
+
+        self.new_tensors = None
+        self.deferred_mode = False
+        self._reset_deferred()
+
+        # Load-time slab arena (per CUDA device): weight tensors loaded inside a deferred-load
+        # bracket carve out of large shared blocks instead of one allocation each. MoE models
+        # with many small per-expert tensors otherwise shatter the caching allocator (measured:
+        # 74k ~1MB + 150k tiny allocations -> 37k segments, 15.3 GB reserved-but-unallocated on
+        # a 512-expert model). The boundary block is shared across brackets, so at most one
+        # partially-external block per module stays pinned after an unload
+        self.arena = {}                    # device index -> [block (uint8), fill offset]
+        self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
+        self.deferred_arena = True
+
+
+    def add_tensor_files(
+        self,
+        directory: str,
+        warn_if_override: bool = True
+    ):
+        # accepts either a directory to scan or a single .safetensors file (e.g. a quantized
+        # n-gram table added to a conversion job's collection)
+        if directory.endswith(".safetensors") and os.path.isfile(directory):
+            new_tensor_files = [directory]
+        else:
+            st_pattern = os.path.join(directory, "*.safetensors")
+            new_tensor_files = glob.glob(st_pattern)
+        self.tensor_files += new_tensor_files
+
+        overrides = 0
+        for st_file in new_tensor_files:
+            self.handles[st_file] = None
+            header = read_header(st_file, self.tensor_name_fixes)
+            self.file_headers[st_file] = header
+            for key in header.keys():
+                if key in ["__metadata__", "_header_offset"]:
+                    continue
+                for k, v in self.tensor_name_fixes.items():
+                    if key.endswith(k):
+                        key = key[:-len(k)] + v
+                if key in self.tensor_file_map and warn_if_override:
+                    print(f" !! Overriding {key} from {self.tensor_file_map[key]} with {st_file}")
+                    overrides += 1
+                self.tensor_file_map[key] = st_file
+        if overrides:
+            print(f" !! Replaced {overrides} tensors from {directory}")
+
+
+    def has_tensor(
+        self,
+        key: str,
+    ):
+        if self.new_tensors and key in self.new_tensors:
+            return True
+        return key in self.tensor_file_map
+
+
+    def has_tensor_group(
+        self,
+        key: str | list,
+        subkeys: list,
+    ):
+        if isinstance(key, list):
+            return all(self.has_tensor_group(k, subkeys) for k in key)
+
+        # Called once per linear during a bulk load, so plain loops rather than nested generators.
+        # True when one source holds every subkey (a list subkey: any one of its alternatives)
+        sources = (self.tensor_file_map, self.new_tensors) if self.new_tensors else (self.tensor_file_map,)
+        prefix = key + "."
+        for source in sources:
+            for subkey in subkeys:
+                if isinstance(subkey, str):
+                    if prefix + subkey not in source:
+                        break
+                else:
+                    for sk in subkey:
+                        if prefix + sk in source:
+                            break
+                    else:
+                        break
+            else:
+                return True
+        return False
+
+
+    def get_tensor_sizes(
+        self,
+        prefix: str,
+    ):
+        assert self.new_tensors is None
+        if prefix in self.tensor_file_map:
+            keys = [prefix]
+        else:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
+        sizes = [self.get_tensor_size(key) for key in keys]
+        return sizes
+
+
+    def get_tensor_size(
+        self,
+        key: str,
+        optional: bool = False
+    ):
+        assert self.new_tensors is None
+        if not key in self.tensor_file_map:
+            if not optional:
+                raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
+            else:
+                return 0
+
+        filename = self.tensor_file_map[key]
+        header = self.file_headers[filename]
+        h = header[key]
+        # _, _, esize = convert_dtype(h["dtype"])
+        # bytesize = np.prod(h["shape"]) * esize
+        beg, end = h["data_offsets"]
+        bytesize = end - beg
+        return bytesize
+
+
+    @cached_property
+    def _get_tensor_file_map_trie(self):
+        import marisa_trie
+        trie = marisa_trie.Trie(self.tensor_file_map.keys())
+        return trie
+    def get_tensor_file_map_trie(self):
+        return self._get_tensor_file_map_trie
+
+
+    def list_tensors(
+        self,
+        prefix: str,
+        only_serializable: bool = False
+    ) -> dict:
+        assert self.new_tensors is None
+        if prefix in self.tensor_file_map:
+            keys = [prefix]
+        else:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
+        results = {}
+        for key in keys:
+            filename = self.tensor_file_map[key]
+            header = self.file_headers[filename]
+            h = header[key]
+            dtype, np_dtype, esize = convert_dtype(h["dtype"])
+            beg, end = h["data_offsets"]
+            results[key] = {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype)
+            }
+            if not only_serializable:
+                results[key]["torch_dtype"] = dtype
+        return results
+
+
+    def get_tensor_meta(
+        self,
+        key: str,
+        optional: bool = True
+    ) -> dict | None:
+        filename = self.tensor_file_map.get(key)
+        if optional and filename is None:
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        beg, end = h["data_offsets"]
+        return {
+            key: {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype)
+            }
+        }
+
+
+    def get_tensor_handle(
+        self,
+        key: str,
+        optional: bool = False,
+    ) -> DiskTensorHandle | None:
+        """
+        Return a DiskTensorHandle for streaming rows of the tensor from disk without loading it.
+        The handle stays valid until the collection is closed.
+        """
+        filename = self.tensor_file_map.get(key)
+        if filename is None:
+            if not optional:
+                raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        handle = DiskTensorHandle(
+            key = key,
+            filename = filename,
+            abs_offset = header["_header_offset"] + h["data_offsets"][0],
+            shape = h["shape"],
+            dtype = dtype,
+        )
+        self.disk_handles.append(handle)
+        return handle
+
+
+    def get_codebook_marker(self, key: str, value: int) -> torch.Tensor | None:
+        """
+        Fetch an EXL3 codebook marker (.mcg / .mul1): an int32 scalar holding the codebook's hash
+        multiplier, which the quantizer writes as a fixed constant and the kernels only test for.
+        Every quantized linear carries one, so loading each through get_tensor costs as much
+        bookkeeping as the trellis itself. Instead, one shared CPU tensor per value is returned for
+        every marker. The stored value is still checked, once per file, so a file holding anything
+        else is reported rather than silently replaced. Anything that is not a plain int32 scalar
+        on disk takes the regular get_tensor path.
+        """
+        if self.new_tensors and key in self.new_tensors:
+            return self.get_tensor(key, "cpu")
+        filename = self.tensor_file_map.get(key)
+        if filename is None:
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        if h["dtype"] != "I32" or h["shape"] != []:
+            return self.get_tensor(key, "cpu")
+        if (filename, value) not in self.checked_markers:
+            beg, end = h["data_offsets"]
+            with open(filename, "rb") as fp:
+                fp.seek(header["_header_offset"] + beg)
+                stored = int.from_bytes(fp.read(end - beg), "little")
+            if stored != value:
+                raise ValueError(f"Codebook marker {key} in {filename} holds {stored:#x}, expected {value:#x}")
+            self.checked_markers.add((filename, value))
+        marker = _codebook_markers.get(value)
+        if marker is None:
+            marker = torch.tensor(value, dtype = torch.uint32).view(torch.int)
+            _codebook_markers[value] = marker
+        return marker
+
+
+    def get_tensors(
+        self,
+        prefix: str,
+        device: torch.device | None = None,
+        allow_bf16: bool = False,
+    ) -> dict:
+        assert self.new_tensors is None
+        if prefix in self.tensor_file_map:
+            keys = [prefix]
+        else:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
+        result = {key: self.get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
+        return result
+
+
+    ARENA_BLOCK = 128 << 20        # slab block size
+    # Larger tensors get their own allocation (few, negligible allocator overhead at this
+    # size). The cap matters even with first-fit backfill: a dense model's 32-64MB projections
+    # shed block tails faster than its scarce small-tensor traffic can pack them (issue #313)
+    ARENA_MAX_TENSOR = 16 << 20
+    ARENA_ALIGN = 256
+    ARENA_MAX_OPEN = 8             # open (partially filled) blocks kept per device
+    ARENA_PRUNE = 4096             # remaining bytes below which a block counts as full
+
+    def release_arena(self):
+        """Drop the open-block list. Blocks stay alive exactly as long as tensors sliced from
+        them do; the list itself would otherwise keep partially filled blocks resident after
+        their tensors are gone (model unload)"""
+        self.arena = {}
+
+
+    def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool, enabled: bool = True):
+        """Persistent weight-tensor allocation: carve from the device's slab blocks while a
+        deferred-load bracket is open, falling back to a plain allocation otherwise (or when the
+        caller opts out with enabled = False: a tensor the module only derives other layouts from
+        would otherwise stay resident in its block, kept alive by the weights sharing it, after
+        the module drops it). First-fit
+        over the open blocks, oldest first, so a block tail left by a tensor that did not fit
+        is packed by later small tensors instead of being abandoned (issue #313: with a single
+        bump block, a dense model's 32-64MB projections left GBs of dead tails). The open list
+        is bounded: blocks are dropped once effectively full, and past ARENA_MAX_OPEN the
+        smallest remainder is dropped, so load/unload churn cannot pin unbounded tails (the
+        weight tensors themselves keep their blocks alive).
+
+        Runs once per loaded tensor, so the block entries carry their storage and capacity as
+        plain values ([block, used, storage, capacity]) and the slice is made with a single set_
+        rather than a slice and two views."""
+        if type(device) is not torch.device:
+            device = torch.device(device)
+        nbytes = math.prod(shape) * dtype.itemsize
+        if not (enabled and self.arena_enable and self.deferred_mode and self.deferred_arena and device.type == "cuda"
+                and 0 < nbytes <= self.ARENA_MAX_TENSOR):
+            return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
+        blocks = self.arena.setdefault(device.index, [])
+        align = self.ARENA_ALIGN
+        for entry in blocks:
+            off = -(-entry[1] // align) * align
+            if off + nbytes <= entry[3]:
+                break
+        else:
+            entry = self._arena_entry(torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device), 0)
+            off = 0
+            blocks.append(entry)
+            if len(blocks) > self.ARENA_MAX_OPEN:
+                # index-based removal: list.remove would compare entries elementwise (tensors)
+                del blocks[min(range(len(blocks)), key = lambda i: blocks[i][3] - blocks[i][1])]
+        entry[1] = off + nbytes
+        if entry[3] - entry[1] < self.ARENA_PRUNE:
+            blocks[:] = [e for e in blocks if e is not entry]
+        # off is ARENA_ALIGN-aligned, so a whole number of elements of any dtype
+        t = torch.empty(0, dtype = dtype, device = device).set_(entry[2], off // dtype.itemsize, shape)
+        if zeros:
+            t.zero_()
+        return t
+
+
+    @staticmethod
+    def _arena_entry(block: torch.Tensor, used: int) -> list:
+        return [block, used, block.untyped_storage(), block.numel()]
+
+    def get_tensor(
+        self,
+        key: str,
+        device: torch.device | None = None,
+        optional: bool = False,
+        allow_bf16: bool = False,
+        float2half: bool = False,
+        no_defer: bool = False,
+        transpose: bool = False,
+        pad_to: tuple = None,
+        fidx: int = None,
+        arena: bool = True,
+    ) -> torch.Tensor | None:
+        """arena = False: allocate outside the loader's slab blocks. For tensors the module reads
+        once to build its own layouts and then drops; slab-backed, their bytes would stay
+        allocated for the life of the block."""
+
+        # Misses first (optional probes for absent tensors are a large share of all calls during
+        # a bulk load, so the miss path stays minimal)
+        if key not in self.tensor_file_map:
+            if self.new_tensors and key in self.new_tensors:
+                tensor = self.new_tensors[key].to(device if device is not None else "cpu")
+                if transpose:
+                    tensor = tensor.T.contiguous()
+                return tensor
+            if not optional:
+                raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
+            else:
+                return None
+
+        if device is None:
+            device = torch.device("cpu")
+
+        if fidx is not None:
+            assert no_defer, "Cannot load fused tensor in deferred mode"
+
+        if self.new_tensors and key in self.new_tensors:
+            tensor = self.new_tensors[key].to(device)
+            if transpose:
+                tensor = tensor.T.contiguous()
+            return tensor
+
+        filename = self.tensor_file_map[key]
+        header = self.file_headers[filename]
+        h = header[key]
+        offset = header["_header_offset"]
+
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        beg, end = h["data_offsets"]
+        bytesize = end - beg
+        shape = h["shape"]
+        numel = math.prod(shape)
+
+        # Guaranteed by validate_header(), but this is the last thing standing between the header
+        # and a raw pointer in the C++ loader, and it is not on any hot path, so it stays a real
+        # check rather than an assertion that -O would strip
+        if numel * esize != bytesize:
+            raise ValueError(
+                f"Incorrect size of {key} in {filename}: shape {shape} of {h['dtype']} is "
+                f"{numel * esize} bytes, data_offsets span {bytesize} bytes"
+            )
+
+        if fidx is not None:
+            if not 0 <= fidx < (shape[0] if shape else 0):
+                raise ValueError(f"Batch tensor {key} has shape {shape}, index {fidx} is out of bounds")
+            shape = shape[1:]
+            numel = math.prod(shape)
+            beg += esize * numel * fidx
+            end = beg + esize * numel
+            bytesize = end - beg
+
+        load_method = self.load_method
+        if load_method == "mt_fread" and self.deferred_mode and not no_defer:
+            load_method = "defer"
+
+        if self.first_open_time is None:
+            self.first_open_time = time.time()
+
+        with (Timer() as timer):
+            match load_method:
+                case "defer":
+                    h = self.handles[filename]
+                    if not h:
+                        try:
+                            h = ext.stloader_open_file(filename)
+                            self.handles[filename] = h
+                        except RuntimeError as e:
+                            print(f" ## Error opening {filename}")
+                            raise e
+                    bf16_to_fp16 = (dtype == torch.bfloat16 and not allow_bf16)
+                    fp32_to_fp16 = (dtype == torch.float and float2half)
+                    load_shape = tuple(shape)
+                    load_shape_t = load_shape if not transpose else (shape[1], shape[0])
+                    load_dtype = dtype
+                    if bf16_to_fp16 and load_dtype == torch.bfloat16:
+                        load_dtype = torch.half
+                    final_shape = pad_to if pad_to is not None else load_shape_t
+                    final_dtype = dtype if not (bf16_to_fp16 or fp32_to_fp16) else torch.float16
+                    tensor = self._arena_alloc(final_shape, final_dtype, device,
+                                               zeros = final_shape != load_shape_t, enabled = arena)
+                    if transpose or fp32_to_fp16 or final_shape != load_shape_t:
+                        # transient staging: NOT from the arena (freed after the fill; it would
+                        # pin its block as dead weight)
+                        temp_tensor = torch.empty(load_shape, dtype = load_dtype, device = device)
+                    else:
+                        temp_tensor = None
+                    # One row per load for the C++ batch front end (column layout in stloader.h).
+                    # The engine writes through the raw pointer, so the tensor written to is kept
+                    # alive here until the pass has run
+                    dest = tensor if temp_tensor is None else temp_tensor
+                    file_idx = self.deferred_file_index.get(filename)
+                    if file_idx is None:
+                        file_idx = len(self.deferred_files)
+                        self.deferred_file_index[filename] = file_idx
+                        self.deferred_files.append(filename)
+                    is_cuda = dest.is_cuda
+                    self.deferred_rows.append((
+                        file_idx,
+                        offset + beg,
+                        bytesize,
+                        dest.data_ptr(),
+                        dest.nbytes,
+                        (_FLAG_BF16_TO_FP16 if bf16_to_fp16 else 0) |
+                        (_FLAG_FP32_TO_FP16 if fp32_to_fp16 else 0) |
+                        (_FLAG_CUDA if is_cuda else 0),
+                        dest.device.index if is_cuda else -1,
+                    ))
+                    self.deferred_keep.append(dest)
+                    if temp_tensor is not None:
+                        self.deferred_finalize.append((key, temp_tensor, tensor, transpose))
+                    self.metrics.deferred_tensors += 1
+
+                case "mt_fread":
+                    h = self.handles[filename]
+                    if not h:
+                        try:
+                            h = ext.stloader_open_file(filename)
+                            self.handles[filename] = h
+                        except RuntimeError as e:
+                            print(f" ## Error opening {filename}")
+                            raise e
+                    # Arena only when the loaded tensor IS the final tensor (a conversion or
+                    # transpose below replaces it, stranding the original in the slab)
+                    final = not (dtype == torch.bfloat16 and not allow_bf16) \
+                        and not (dtype == torch.float and float2half) \
+                        and not transpose and pad_to is None
+                    if final:
+                        tensor = self._arena_alloc(shape, dtype, device, zeros = False, enabled = arena)
+                    else:
+                        tensor = torch.empty(shape, dtype = dtype, device = device)
+                    assert tensor.is_contiguous()
+                    # No sync needed here: the loader engine synchronizes the target device
+                    # before writing from its own streams
+                    ext.stloader_read(
+                        h,
+                        offset + beg,
+                        bytesize,
+                        tensor,
+                    )
+                    if tensor.dtype == torch.bfloat16 and not allow_bf16:
+                        tensor = tensor.to(torch.float16)
+                    if tensor.dtype == torch.float and float2half:
+                        tensor = tensor.to(torch.float16)
+                    if transpose:
+                        tensor = tensor.T if len(tensor.shape) > 0 else tensor
+                    if pad_to is not None:
+                        padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
+                        padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
+                        tensor = padded
+                    tensor = tensor.contiguous()
+                    self.metrics.direct_tensors += 1
+
+                case "python":
+                    with open(filename, "rb") as fp:
+                        fp.seek(offset + beg)
+                        buffer = bytearray(fp.read(bytesize))
+                        tensor = torch.frombuffer(buffer, dtype = dtype, count = numel).reshape(shape)
+                        if tensor.dtype == torch.bfloat16 and not allow_bf16:
+                            tensor = tensor.to(torch.float16)
+                        if tensor.dtype == torch.float and float2half:
+                            tensor = tensor.to(torch.float16)
+                        if transpose:
+                            tensor = tensor.T
+                        if pad_to is not None:
+                            padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
+                            padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
+                            tensor = padded
+                        tensor = tensor.to(device).contiguous()
+                    self.metrics.direct_tensors += 1
+
+                case _:
+                    raise ValueError(f"Invalid load_method: {load_method}")
+
+        self.metrics.bytes_loaded += bytesize
+        self.metrics.time_elapsed += timer.interval
+
+        return tensor
+
+
+    def release_file(self, filename: str):
+        """
+        Close the loader's persistent handle for one file (reopened on demand if a later load
+        needs it). Modules that stream a file with unbuffered reads call this after their
+        buffered loads from it: on Windows, a file object that has done cached reads keeps a
+        live cache map on the file, and noncached reads coherency-check against it at ~QD 1
+        until it dies with the file object (see ngram_gather_win.cpp).
+        """
+        h = self.handles.get(filename)
+        if h:
+            ext.stloader_close_file(h)
+            self.handles[filename] = None
+
+    def close(self):
+        assert self.new_tensors is None
+        if self.first_open_time is not None:
+            self.metrics.total_open_elapsed += time.time() - self.first_open_time
+            self.first_open_time = None
+        for filename, h in self.handles.items():
+            if h:
+                ext.stloader_close_file(h)
+                self.handles[filename] = None
+        for h in self.disk_handles:
+            h.close()
+        self.disk_handles = []
+
+
+    @cached_property
+    def _max_key_len(self):
+        l = max(len(k) for k in self.tensor_file_map.keys())
+        return l
+
+
+    def max_key_len(self):
+        return self._max_key_len
+
+
+    def set_new_tensors(self, new_tensors):
+        self.new_tensors = new_tensors
+
+
+    def begin_deferred_load(self, arena: bool = True):
+        """arena = False keeps this load's tensors out of the slab arena: for modules whose
+        weights leave the device right after loading (vision_pinned), slab slices would pin
+        their whole 128 MB blocks in VRAM for the lifetime of the neighbouring tensors."""
+        assert not self.deferred_mode
+        self.deferred_mode = True
+        self.deferred_arena = arena
+        # Open-block state at the start of the bracket, so an aborted load (a module rolled
+        # off a device by an out-of-memory error) can hand back the blocks it opened and the
+        # space it carved from older ones: the module's tensors die with it, but a block
+        # opened for them would otherwise stay resident on the fullest device
+        self.arena_snapshot = {d: [(e[0], e[1]) for e in blocks] for d, blocks in self.arena.items()}
+
+
+    def end_deferred_load(self):
+        assert self.deferred_mode
+        self.arena_snapshot = None
+
+        with (Timer() as timer):
+
+            rows = self.deferred_rows
+            if rows:
+                # Rows sorted by file, then offset, so reads are sequential and the C++ loader can
+                # coalesce adjacent tensors/chunks into single reads. All files go in one pass to
+                # avoid a join barrier per file. File indices follow first use, so sorting on them
+                # keeps the files in the order they were first requested
+                loads = np.fromiter(itertools.chain.from_iterable(rows), dtype = np.int64,
+                                    count = len(rows) * _NUM_COLS).reshape(-1, _NUM_COLS)
+                loads = loads[np.lexsort((loads[:, _COL_OFFSET], loads[:, _COL_FILE]))]
+                chunk = MAX_DEFERRED_LOAD_CHUNK
+                self.metrics.total_chunks += int(((loads[:, _COL_SIZE] + chunk - 1) // chunk).sum())
+                ext.stloader_deferred_batch(
+                    [self.handles[f] for f in self.deferred_files],
+                    torch.from_numpy(np.ascontiguousarray(loads)),
+                    chunk,
+                )
+
+            # Loads that went through a staging tensor (transpose, padding or fp32->fp16)
+            for key, src, dest, transpose in self.deferred_finalize:
+                if transpose:
+                    src = src.T
+                unpadded_idx = tuple(slice(0, s) for s in src.shape)
+                try:
+                    dest[unpadded_idx].copy_(src)
+                except RuntimeError as e:
+                    raise ValueError(
+                        f"Deferred load of {key}: source shape {tuple(src.shape)} "
+                        f"(transpose = {transpose}) does not fit destination "
+                        f"{tuple(dest.shape)}"
+                    ) from e
+
+        self.metrics.time_elapsed += timer.interval
+        self.metrics.deferred_passes += 1
+
+        self.deferred_mode = False
+        self._reset_deferred()
+
+
+    def _reset_deferred(self):
+        self.deferred_rows = []
+        self.deferred_files = []
+        self.deferred_file_index = {}
+        self.deferred_keep = []
+        self.deferred_finalize = []
+
+
+    def abort_deferred_load(self):
+        self.deferred_mode = False
+        self._reset_deferred()
+        snapshot = getattr(self, "arena_snapshot", None)
+        if snapshot is not None:
+            # Every slab slice handed out since the bracket opened belongs to the aborted module
+            self.arena = {d: [self._arena_entry(b, off) for b, off in saved] for d, saved in snapshot.items()}
+            self.arena_snapshot = None
+
+
+    def find_stc(self, key):
+        return self
+
+
+# noinspection PyMissingConstructor
+class VariantSafetensorsCollection(SafetensorsCollection):
+
+    def __init__(
+        self,
+        main: SafetensorsCollection,
+        **kwargs
+    ):
+        self.main = main
+        self.stcs = []
+        self._get_tensor_sizes_cache = {}
+
+    def compile_star_globs(self, patterns, *, flags = 0):
+        # Turn list of filter globs into single, compiled regex
+        alts = []
+        seen = set()
+        for p in patterns:
+            p = re.sub(r'\*+', '*', p.strip())
+            if p in seen:
+                continue
+            seen.add(p)
+            if p == '*':
+                return re.compile(r'^.*$', flags)
+            frag = '.*'.join(map(re.escape, p.split('*')))
+            alts.append(frag)
+        if not alts:
+            return re.compile(r'^\b\B$', flags)
+        big = r'^(?:' + '|'.join(alts) + r')$'
+        return re.compile(big, flags)
+
+
+    def add_stc(self, filters, stc):
+        rx = self.compile_star_globs(filters)
+        self.stcs = [(filters, rx, stc)] + self.stcs
+
+
+    def find_stc(self, key):
+        for filters, rx, stc in self.stcs:
+            if rx.fullmatch(key):
+                return stc
+        return self.main
+
+
+    def release_file(self, filename: str):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.release_file(filename)
+
+
+    def has_tensor(
+        self,
+        key: str,
+    ):
+        stc = self.find_stc(key)
+        return stc.has_tensor(key)
+
+
+    def has_tensor_group(
+        self,
+        key: str,
+        subkeys: list,
+    ):
+        for subkey in subkeys:
+            sk_exists = False
+            for sk in [subkey] if isinstance(subkey, str) else subkey:
+                k = f"{key}.{sk}"
+                stc = self.find_stc(k)
+                if k in stc.tensor_file_map:
+                    sk_exists = True
+                    break
+            if not sk_exists:
+                return False
+        return True
+
+
+    def get_tensor_sizes(
+        self,
+        prefix: str,
+    ):
+        if prefix not in self._get_tensor_sizes_cache:
+            keys = [self.main.tensor_file_map.get(prefix)]
+            if keys[0] is None:
+                keys = []
+            keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
+            sizes = [self.get_tensor_size(key) for key in keys]
+            self._get_tensor_sizes_cache[prefix] = sizes
+        return self._get_tensor_sizes_cache[prefix]
+
+
+    def get_tensor_size(
+        self,
+        key: str,
+        optional: bool = False
+    ):
+        stc = self.find_stc(key)
+        return stc.get_tensor_size(key, optional)
+
+
+    def list_tensors(
+        self,
+        prefix: str,
+        only_serializable: bool = False
+    ) -> dict:
+        if prefix in self.main.tensor_file_map:
+            keys = [prefix]
+        else:
+            keys = []
+        keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
+
+        if len(self.stcs):
+            keys = set(keys)
+            for _, _, s in self.stcs:
+                if prefix in s.tensor_file_map:
+                    keys_ = [prefix]
+                else:
+                    keys_ = []
+                keys_ += s.get_tensor_file_map_trie().keys(prefix + ".")
+                keys |= set(keys_)
+            keys = list(keys)
+
+        results = {}
+        for key in keys:
+            stc = self.find_stc(key)
+            filename = stc.tensor_file_map[key]
+            header = stc.file_headers[filename]
+            h = header[key]
+            dtype, np_dtype, esize = convert_dtype(h["dtype"])
+            beg, end = h["data_offsets"]
+            results[key] = {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype)
+            }
+            if not only_serializable:
+                results[key]["torch_dtype"] = dtype
+        return results
+
+
+    def get_tensors(
+        self,
+        prefix: str,
+        device: torch.device | None = None,
+        allow_bf16: bool = False,
+    ) -> dict:
+        keys = [
+            key for key in self.main.tensor_file_map.keys()
+            if key == prefix or key.startswith(prefix + ".")
+        ]
+        result = {key: self.find_stc(key).get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
+        return result
+
+
+    def get_tensor(
+        self,
+        key: str,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor | None:
+        stc = self.find_stc(key)
+        return stc.get_tensor(key, *args, **kwargs)
+
+
+    def get_tensor_handle(
+        self,
+        key: str,
+        *args,
+        **kwargs,
+    ) -> DiskTensorHandle | None:
+        stc = self.find_stc(key)
+        return stc.get_tensor_handle(key, *args, **kwargs)
+
+
+    def get_codebook_marker(self, key: str, value: int) -> torch.Tensor | None:
+        return self.find_stc(key).get_codebook_marker(key, value)
+
+
+    def close(self):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.close()
+
+
+    def max_key_len(self):
+        return self.main.max_key_len()
+
+
+    def set_new_tensors(self, new_tensors):
+        raise NotImplementedError()
+
+
+    def begin_deferred_load(self, arena: bool = True):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.begin_deferred_load(arena)
+
+
+    def end_deferred_load(self):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.end_deferred_load()
+
+
+    def abort_deferred_load(self):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.abort_deferred_load()
+
+
+    def release_arena(self):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.release_arena()

@@ -1,0 +1,21 @@
+[09:19:58] ready
+[09:19:58] pfprobe
+{"tokens": 8192, "ttft_s": 14.4, "tok_s": 569.0}
+{"tokens": 32768, "ttft_s": 39.69, "tok_s": 825.6}
+{"tokens": 8192, "ttft_s": 13.47, "tok_s": 608.1}
+PFPROBE_DONE
+[09:21:46] panel
+{"positions": 2154, "top1_agreement": 1.0, "mean_kl_top20": 0.0}
+[09:23:50] greedy
+GREEDY_DIFF [False, False, False, False, False]
+[09:26:53] verify
+{"vram_checked":128,"vram_bad":0,"ram_checked":128,"ram_bad":0,"table_bad":0,"rows_stale_nonvram":6533,"home_bad_resident":0,"home_bad_nonresident":0,"ram_resident":4737,"vram_and_ram":2,"pinned":0,"dev_bad_rows":0}
+[09:27:27] sweep
+decode C1@32k: 13.46 tok/s
+SWEEP DONE runs/N116-glm53-nvme/s2/s3b2_55g/sweep.json
+sweep exit 0
+[10:05:21] verify
+{"vram_checked":128,"vram_bad":0,"ram_checked":128,"ram_bad":0,"table_bad":0,"rows_stale_nonvram":6394,"home_bad_resident":0,"home_bad_nonresident":0,"ram_resident":4737,"vram_and_ram":2,"pinned":0,"dev_bad_rows":0}
+kcheck 2026-10-07T10:06:34+02:00 boot=2026-10-06 22:31:39 corrected_events=11559 gpu0_path_corrected_lines=3050
+CLEAN
+[10:06:34] ARM_DONE

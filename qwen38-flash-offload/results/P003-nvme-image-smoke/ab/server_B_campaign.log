@@ -1,0 +1,33 @@
+GPU 0: NVIDIA GeForce RTX 3090 (UUID: GPU-936598ed-bbc0-3c75-3929-eae1a2196657)
+[glm53] mode nvme3: host 38 CPUs visible, MemAvailable 461 GiB, GPU 24576 MiB, CPU tier 0
+[glm53] glm53/serve.py -m /models -cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4 --host 0.0.0.0 --port 30000 --served-name glm-5.3-flash 
+/opt/glm53/glm53/serve.py:195: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+ -- nv_tier [    0.1s] installed: store /nvx/glm53_flash_exl3_3.05bpw_experts.bin, 42 routed layers, loader skips expert trellis bytes | memcg cur 0.35 peak 0.35 anon 0.33 file 0.00 GiB, host avail 461.6
+ -- expert_cache installed
+ -- triton_pin: pinned ['chunk_gated_delta_rule_fwd_kernel_h_blockdim64', 'chunk_gla_fwd_kernel_o', 'chunk_kda_fwd_kernel_inter_solve_fused', 'chunk_kda_fwd_kernel_intra_token_parallel', 'chunk_local_cumsum_vector_kernel', 'l2norm_fwd_kernel', 'recompute_w_u_fwd_kda_kernel'] from /opt/glm53/data/triton_pin_exact.json
+ -- Loading /models
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+ -- nv_tier [   59.8s] model loaded + VRAM pool built; DONTNEED on 16 checkpoint files | memcg cur 3.25 peak 10.58 anon 3.15 file 0.06 GiB, host avail 458.2
+ -- nv_tier [   60.0s] CPU tier scale copies: 0.42 GiB | memcg cur 3.55 peak 10.58 anon 3.45 file 0.06 GiB, host avail 457.9
+ -- nv_tier [   60.0s] nv2: rcs reserve 4.0 GiB, margin 3.0 GiB, prefill ring 192 slots (1.69 GiB) -> RAM tier 4831 slots (42.46 GiB) | memcg cur 3.55 peak 10.58 anon 3.45 file 0.06 GiB, host avail 457.9
+ -- nv_tier [   63.0s] nv2: RAM arena + prefill ring registered | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 413.2
+ -- nv_tier [   63.0s] nv2 engine up: 42 layers x 288, readers 16 on [26, 27, 28].., exclusive True, CPU tier True | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 413.2
+ -- nv_tier [   64.9s] nv2 RAM warm: 4831 experts in 1.8 s | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 413.2
+ -- nv_tier [   65.9s] nv2 post-warm: 1260 VRAM-resident, 1260 RAM copies of them dropped (exclusive), RAM resident 4831, free 0 | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 413.2
+ -- nv_tier [   66.7s] nv2 CPU tier: 22 threads on 2-23, mode -1, swiglu clamp 10.0, selftest {'EXACT': 0.000999, 'AFFINE': 0.001067, 'I16': 0.001071} | memcg cur 47.80 peak 48.06 anon 47.62 file 0.06 GiB, host avail 413.6
+ -- expert_cache: cuda:0: 42 MoE layers (experts 0..287), 1280 slots x 9.44 MB = 12.08 GB (30.5/layer), admit <= 64 picks, stage 2 x 295 experts (>= 512 picks), warm /opt/glm53/data/stats_own_dec.json
+ -- nv_tier [   66.7s] nv2 ready: 36288 expert linears on the bounce slot, 114.2 GB of checkpoint expert bytes never read, DONTNEED on 16 files | memcg cur 47.80 peak 48.06 anon 47.62 file 0.06 GiB, host avail 413.6
+ -- nv2 startup verify: {'vram_checked': 32, 'vram_bad': 0, 'ram_checked': 32, 'ram_bad': 0, 'table_bad': 0, 'rows_stale_nonvram': 0, 'home_bad_resident': 0, 'home_bad_nonresident': 0, 'ram_resident': 4831, 'vram_and_ram': 0, 'pinned': 0, 'dev_bad_rows': 0}
+ -- k_hcfuse (K101): 45/45 blocks fused for R <= 8
+ -- loaded in 66.3 s
+[transformers] You are using a model of type `glm5_next` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+ -- main thread on cpus [24]

@@ -1,0 +1,29 @@
+{
+ "ceiling_gbps": 26.0,
+ "members": [
+  "nvme3n1",
+  "nvme1n1",
+  "nvme0n1",
+  "nvme2n1"
+ ],
+ "phases": {
+  "prefill_8k": {
+   "seconds": 38.0,
+   "read_gbps": 17.33,
+   "pct_of_ceiling": 66.7,
+   "peak_1s_gbps": 24.75,
+   "md_iops": 148220,
+   "device_iops": 148220,
+   "avg_read_kb_device": 114.2
+  },
+  "decode_C1": {
+   "seconds": 305.3,
+   "read_gbps": 19.91,
+   "pct_of_ceiling": 76.6,
+   "peak_1s_gbps": 23.8,
+   "md_iops": 170300,
+   "device_iops": 170300,
+   "avg_read_kb_device": 114.2
+  }
+ }
+}

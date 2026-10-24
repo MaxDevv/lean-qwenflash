@@ -1,0 +1,155 @@
+from .custom import *
+
+class DefaultSampler(CustomSampler):
+    """
+    Sensible default for most models
+    """
+    def __init__(self):
+        super().__init__([
+            SS_MinP(0.08),
+            SS_Temperature(0.8),
+            SS_Sample()
+        ])
+
+class ArgmaxSampler(CustomSampler):
+    """
+    Returns top token
+    """
+    def __init__(self):
+        super().__init__([
+            SS_Argmax()
+        ])
+
+GreedySampler = ArgmaxSampler
+
+class CategoricalSampler(CustomSampler):
+    """
+    Samples from unmodified categorical distribution
+    """
+    def __init__(self, temperature: float = 1.0):
+        if temperature == 0:
+            super().__init__([
+                SS_Argmax()
+            ])
+        else:
+            super().__init__([
+                SS_Temperature(temperature),
+                SS_Sample()
+            ])
+
+GumbelSampler = CategoricalSampler
+
+class TopKSampler(CustomSampler):
+    """
+    Truncates distribution to top_k values before sampling
+    """
+    def __init__(self, top_k: int, temperature: float = 1.0):
+        assert top_k >= 1
+        if top_k == 1 or temperature == 0:
+            super().__init__([
+                SS_Argmax()
+            ])
+        else:
+            super().__init__([
+                SS_Temperature(temperature),
+                SS_TopK(top_k),
+                SS_Sample()
+            ])
+
+class TopPSampler(CustomSampler):
+    """
+    Truncates distribution to the top probabilities <= top_p (at least 1 candidate) before sampling
+    """
+    def __init__(self, top_p: float, temperature: float = 1.0, temperature_last = False):
+        if top_p == 0 or temperature == 0:
+            super().__init__([
+                SS_Argmax()
+            ])
+        else:
+            if temperature_last:
+                super().__init__([
+                    SS_TopP(top_p),
+                    SS_Temperature(temperature),
+                    SS_Sample()
+                ])
+            else:
+                super().__init__([
+                    SS_Temperature(temperature),
+                    SS_TopP(top_p),
+                    SS_Sample()
+                ])
+
+class ComboSampler(CustomSampler):
+    """
+    Single class with an argument for common sampling steps
+    """
+    def __init__(
+        self,
+        rep_p: float = 1.0,
+        freq_p: float = 0.0,
+        pres_p: float = 0.0,
+        rep_sustain_range: int = int(10e7),
+        rep_decay_range: int = 0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 1.75,
+        dry_allowed_length: int = 2,
+        dry_range: int = 0,
+        dry_sequence_breakers: frozenset[int] | set[int] | list[int] | None = None,
+        temperature: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        temp_last: bool = False,
+        adaptive_target: float = 1.0,
+        adaptive_decay: float = 0.9,
+        logit_bias: dict[int, float] | None = None,
+    ):
+        # Steps with default parameters become no-ops. dry_sequence_breakers takes token IDs
+        # (see dry_sequence_breaker_tokens); left as None, the default set is derived from the
+        # tokenizer at sampling time
+        stack = [
+            SS_LogitBias(logit_bias or {}),
+            SS_RepP(rep_p, rep_sustain_range, rep_decay_range),
+            SS_PresFreqP(pres_p, freq_p, rep_sustain_range, rep_decay_range),
+            SS_DRY(dry_multiplier, dry_base, dry_allowed_length, dry_range, dry_sequence_breakers),
+        ]
+
+        if temperature == 0.0 or top_k == 1:
+            stack += [
+                SS_Argmax()
+            ]
+        else:
+            stack += [
+                SS_Temperature(temperature if not temp_last else 1.0),
+                SS_MinP(min_p),
+                SS_TopK(top_k),
+                SS_TopP(top_p),
+                SS_Temperature(temperature if temp_last else 1.0),
+            ]
+
+            if adaptive_target != 1.0:
+                stack += [
+                    SS_AdaptiveP(adaptive_target, adaptive_decay)
+                ]
+            else:
+                stack += [
+                    SS_Sample()
+                ]
+
+        super().__init__(stack)
+
+class AdaptivePSampler(CustomSampler):
+    """
+    Min-P followed by Adaptive-P
+    """
+    def __init__(
+        self,
+        min_p: float = 0.08,
+        target: float = 0.5,
+        decay: float = 0.9,
+    ):
+        stack = [
+            SS_MinP(min_p),
+            SS_AdaptiveP(target, decay)
+        ]
+        super().__init__(stack)

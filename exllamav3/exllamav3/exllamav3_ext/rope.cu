@@ -1,0 +1,658 @@
+#include <cuda_fp16.h>
+#include "rope.cuh"
+
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "util.h"
+#include "util.cuh"
+#include "reduction.cuh"
+
+#define MAX_NUM_THREADS 1024
+#define MAX_ROTATE_DIMS 4
+
+using bfloat16 = __nv_bfloat16;
+using bfloat162 = __nv_bfloat162;
+
+template <int rope_mode, bool norm_bf16>
+__global__
+void rope_kernel
+(
+    const half* __restrict__ q,
+    half* __restrict__ out_q,
+    const half* __restrict__ k,
+    half* __restrict__ out_k,
+    const float* __restrict__ inv_freq,
+    const int bsz,
+    const int seq_len,
+    const int num_heads_q,
+    const int num_heads_k,
+    const int head_dim,
+    const int q_head_stride,
+    const int k_head_stride,
+    const int partial_head_dim,
+    const int position,
+    const uint32_t* __restrict__ positions,
+    const uint32_t* __restrict__ position_ids,
+    float attn_factor,
+    const void* __restrict__ q_norm,
+    const void* __restrict__ k_norm,
+    const float norm_eps,
+    const float norm_constant_bias,
+    const bool inv_freq_table,
+    const int inv_freq_stride,
+    const float llama_4_scaling_beta,
+    const int llama_4_scaling_original,
+    int position_ids_stride,
+    int rotate_dims,
+    int rotate_offset
+)
+{
+    int batch = blockIdx.y;
+    int token_pos = blockIdx.x;
+    int t = threadIdx.x;
+    int t_head = threadIdx.y;
+
+    auto get_pos = [&] (int rdim) -> int
+    {
+        int pos = token_pos + position;
+        if (positions)
+            pos = token_pos + positions[batch];
+        else if (position_ids)
+        {
+            int idx = (batch * seq_len + token_pos) * position_ids_stride;
+            if (position_ids_stride > 1) idx += rdim;
+            pos = position_ids[idx];
+        }
+        return pos;
+    };
+
+    auto get_sincos = [&] (int rdim, float &sin, float &cos)
+    {
+        int pos = get_pos(rdim);
+        if (!inv_freq_table)
+        {
+            float fr = inv_freq[t];
+            float pf = __int2float_rn(pos);
+            sin = __sinf(fr * pf) * attn_factor;
+            cos = __cosf(fr * pf) * attn_factor;
+        }
+        else
+        {
+            float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
+            sin = __sinf(fr) * attn_factor;
+            cos = __cosf(fr) * attn_factor;
+        }
+    };
+
+    // Llama 4 scaling: position-dependent scale on the full query head, queries only (the
+    // reference scales query_states after rope; keys enter the cache unscaled)
+    float l4_scaling = 1.0f;
+    if (llama_4_scaling_beta > 0.0f)
+        l4_scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(get_pos(0) / llama_4_scaling_original));
+
+    float sin_cache[MAX_ROTATE_DIMS];
+    float cos_cache[MAX_ROTATE_DIMS];
+    if (t < partial_head_dim / 2)
+    {
+        for (int rdim = 0; rdim < rotate_dims; ++rdim)
+        {
+            get_sincos(rdim, sin_cache[rdim], cos_cache[rdim]);
+        }
+    }
+
+    // Shared buffer
+    __shared__ half norm_head[MAX_NUM_THREADS * 2];
+    __shared__ float sums[MAX_NUM_THREADS / 32];
+
+    // Prep
+    int head_dim_pad = (head_dim + 63) / 64 * 64;
+
+    // Loop over heads
+    // Heads are distributed over gridDim.z as well as blockDim.y: at decode (seq 1, bsz 1)
+    // the per-token grid is otherwise a single block walking every head serially between
+    // block-wide barriers.
+    // The head count is rarely a multiple of blockDim.y, so the last round leaves some thread
+    // rows without a head. The loop runs the same number of rounds for the whole block (row 0's
+    // count) and those rows idle through the round's barriers, so every barrier is reached by
+    // every thread
+    const int num_heads = num_heads_q + num_heads_k;
+    const int head_base = blockIdx.z * blockDim.y;
+    const int head_step = gridDim.z * blockDim.y;
+    const int head_rounds = head_base < num_heads ? (num_heads - head_base + head_step - 1) / head_step : 0;
+    for (int round = 0; round < head_rounds; ++round)
+    {
+        const int head_idx = head_base + round * head_step + threadIdx.y;
+        const bool active = head_idx < num_heads;
+
+        const half* g_head_in_ptr = nullptr;
+        half* g_head_out_ptr = nullptr;
+        const void* norm_weight = nullptr;
+        if (head_idx < num_heads_q)
+        {
+            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
+            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
+            norm_weight = q_norm;
+        }
+        else if (active)
+        {
+            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
+            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
+            norm_weight = k_norm;
+        }
+
+        // Temp storage
+        half* sh_head = norm_head + t_head * head_dim_pad;
+        auto load_head = [&] ()
+        {
+            if (active)
+            {
+                if (t < head_dim / 2)
+                    ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
+                else
+                    ((half2*) sh_head)[t] = half2{};
+            }
+            __syncthreads();
+        };
+        auto store_head = [&] ()
+        {
+            if (active && t < head_dim / 2)
+                ((half2*) g_head_out_ptr)[t] = ((half2*) sh_head)[t];
+            __syncthreads();
+        };
+
+        // Apply embeddings
+        auto apply_rope = [&] ()
+        {
+            for (int rdim = 0; rdim < rotate_dims; ++rdim)
+            {
+                int offset = rotate_offset + partial_head_dim * rdim;
+                if (active && t < partial_head_dim / 2)
+                {
+                    float sin = sin_cache[rdim];
+                    float cos = cos_cache[rdim];
+
+                    if constexpr (rope_mode == ROPESTYLE_NEOX)
+                    {
+                        float v1 = __half2float(sh_head[offset + t]);
+                        float v2 = __half2float(sh_head[offset + t + partial_head_dim / 2]);
+                        float r1 = v1 * cos - v2 * sin;
+                        float r2 = v2 * cos + v1 * sin;
+                        sh_head[offset + t] = __float2half_rn(r1);
+                        sh_head[offset + t + partial_head_dim / 2] = __float2half_rn(r2);
+                    }
+                    else if constexpr (rope_mode == ROPESTYLE_GPTJ)
+                    {
+                        half2 *tptr = (half2*)(sh_head + offset + t * 2);
+                        half2 v = *tptr;
+                        float v1 = __low2float(v);
+                        float v2 = __high2float(v);
+                        float r1 = v1 * cos - v2 * sin;
+                        float r2 = v2 * cos + v1 * sin;
+                        v = __floats2half2_rn(r1, r2);
+                        *tptr = v;
+                    }
+                }
+            }
+            __syncthreads();
+        };
+
+        // RMS Norm
+        auto apply_norm = [&] ()
+        {
+            half2 *tptr = (half2*)(sh_head + t * 2);
+            int lane_id = threadIdx.x % 32;
+            int warp_id = threadIdx.x / 32;
+            int warps = blockDim.x / 32;
+
+            // Sum of squares. A thread row is a whole number of warps, so the warp reduction
+            // never mixes active and idle lanes
+            half2 v = {};
+            float v1 = 0.0f;
+            float v2 = 0.0f;
+            float sum = 0.0f;
+            if (active)
+            {
+                v = *tptr;
+                v1 = __low2float(v);
+                v2 = __high2float(v);
+                sum = v1 * v1 + v2 * v2;
+                sum = warp_reduce_sum_f(sum);
+                if (lane_id == 0) sums[warps * t_head + warp_id] = sum;
+            }
+            __syncthreads();
+
+            if (active)
+            {
+                sum = sums[warps * t_head];
+                for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
+            }
+
+            // Normalize and downcast
+            float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
+            v1 *= rmf;
+            v2 *= rmf;
+
+            // Downcast, apply weight and store. Lanes past head_dim / 2 (block rounded up to whole warps)
+            // hold padding and must not read the weight
+            if (active && t * 2 < head_dim)
+            {
+                if constexpr (norm_bf16)
+                {
+                    bfloat162 *wptr = (bfloat162*)(((bfloat16*)norm_weight) + t * 2);
+                    float2 w = __bfloat1622float2(*wptr);
+                    w.x += norm_constant_bias;
+                    w.y += norm_constant_bias;
+                    v1 *= w.x;
+                    v2 *= w.y;
+                    v = __floats2half2_rn(v1, v2);
+                }
+                else
+                {
+                    half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
+                    half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
+                    half2 w = __hadd2(*wptr, norm_constant_bias_h2);
+                    v = __floats2half2_rn(v1, v2);
+                    v = __hmul2(w, v);
+                }
+
+                *tptr = v;
+            }
+            __syncthreads();
+        };
+
+        // Llama 4 scaling. Must be called by the whole block (blockDim.y walks q and k heads
+        // concurrently and the lambda syncs), so k heads scale by 1.0
+        auto apply_l4_scaling = [&] (float scaling)
+        {
+            if (active && t < head_dim / 2)
+            {
+                half2* tptr = ((half2*) sh_head) + t;
+                half2 v = *tptr;
+                *tptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+            }
+            __syncthreads();
+        };
+
+        // Do the things
+        load_head();
+        if (q_norm) apply_norm();
+        apply_rope();
+        if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
+        store_head();
+    }
+}
+
+/*
+
+Apply position embeddings, works in-place
+
+- q: tensor of shape (bsz, seq_len, num_heads_q, head_dim), float16
+- k: tensor of shape (bsz, seq_len, num_heads_k, head_dim), float16, optional
+- out_q: output for queries, may be == q
+- out_k: output for keys, may be == k
+- inv_freq: tensor of shape (head_dim / 2), float32
+- position: int, constant position offset (position ID of first token across batch)
+- positions: tensor of shape (bsz), (position ID of first token per seq), int, optional
+- position_ids: tensor of shape (bsz, seq_len), int, optional
+- rope_mode: ROPESTYLE_NEOX
+- attn_factor: scale for sin/cos factors
+- q_norm: optional RMS norm weight, must be supplied with k_norm
+- k_norm: optional RMS norm weight, must be supplied with q_norm
+- norm_eps
+- norm_constant_bias
+
+Either positions or position_ids overrides position
+*/
+
+void rope_gr
+(
+    const at::Tensor& q,
+    at::Tensor& out_q,
+    const c10::optional<at::Tensor>& k,
+    c10::optional<at::Tensor>& out_k,
+    const at::Tensor& inv_freq,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    int rope_mode,
+    float attn_factor,
+    const c10::optional<at::Tensor>& q_norm,
+    const c10::optional<at::Tensor>& k_norm,
+    float norm_eps,
+    float norm_constant_bias,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    int rotate_dims,
+    int rotate_offset,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    int bsz = q.size(0);
+    int seq_len = q.size(1);
+    int num_heads_q = q.size(2);
+    int q_head_stride = q.stride(2);
+    int k_head_stride = k.has_value() ? (int) k.value().stride(2) : 0;
+    TORCH_CHECK(q.stride(3) == 1, "rope: q innermost dim must be dense");
+    TORCH_CHECK(out_q.strides() == q.strides(), "rope: out_q must share q's layout");
+    int num_heads_k = 0;
+    int head_dim = q.size(3);
+    int partial_head_dim = inv_freq.size(-1) * 2;
+    int inv_freq_stride = 0;
+    TORCH_CHECK(rotate_dims > 0 && rotate_dims <= MAX_ROTATE_DIMS, "rotate_dims out of range");
+    TORCH_CHECK(rotate_dims == 1 || head_dim == partial_head_dim * rotate_dims, "rotate_dims is inconsistent with inv_freq and head_dim");
+    TORCH_CHECK(rotate_offset >= 0 && rotate_offset + partial_head_dim * rotate_dims <= head_dim,
+                "rotate_offset out of range");
+
+    const half* q_ptr = (half*) q.data_ptr();
+    half* out_q_ptr = (half*) out_q.data_ptr();
+    const half* k_ptr = (const half*) OPTPTR(k);
+    half* out_k_ptr = (half*) OPTPTR(out_k);
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE_OPT(k, kHalf);
+    TORCH_CHECK_DIM(q, 4);
+    TORCH_CHECK_DIM_OPT(k, 4);
+
+    if (k_ptr)
+    {
+        num_heads_k = k.value().size(2);
+        TORCH_CHECK(k.value().size(0) == bsz, "k is incorrect shape");
+        TORCH_CHECK(k.value().size(1) == seq_len, "k is incorrect shape");
+        TORCH_CHECK(k.value().size(3) == head_dim, "k is incorrect shape");
+    }
+
+    const float* inv_freq_ptr = (const float*) inv_freq.data_ptr();
+    TORCH_CHECK_DTYPE(inv_freq, kFloat);
+    bool inv_freq_table = false;
+    if (inv_freq.dim() > 1)
+    {
+        TORCH_CHECK(inv_freq.dim() >= 2 && inv_freq.dim() <= 3, "inv_freq table must be 2-D or 3-D");
+        // TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
+        inv_freq_table = true;
+        inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
+    }
+
+    uint32_t* positions_ptr = (uint32_t*) OPTPTR(positions);
+    uint32_t* position_ids_ptr = (uint32_t*) OPTPTR(position_ids);
+    int position_ids_stride = 1;
+    TORCH_CHECK_DTYPE_OPT(positions, kInt);
+    TORCH_CHECK_DTYPE_OPT(position_ids, kInt);
+    TORCH_CHECK((positions_ptr != nullptr) + (position_ids_ptr != nullptr) <= 1, "invalid arguments")
+
+    if (positions_ptr)
+    {
+        TORCH_CHECK_DIM(positions.value(), 1)
+        TORCH_CHECK(positions.value().size(0) == bsz, "positions is incorrect shape");
+    }
+
+    if (position_ids_ptr)
+    {
+        TORCH_CHECK(position_ids.value().is_contiguous(), "position_ids must be contiguous");
+        int rd = position_ids.value().dim();
+        TORCH_CHECK(rd == 2 || (rd == 3 && position_ids.value().size(-1) == rotate_dims), "position_ids wrong number of dims")
+        TORCH_CHECK(position_ids.value().size(0) == bsz, "position_ids is incorrect shape");
+        TORCH_CHECK(position_ids.value().size(1) == seq_len, "position_ids is incorrect shape");
+        if (rd == 3) position_ids_stride = rotate_dims;
+    }
+
+    void* q_norm_ptr = (void*) OPTPTR(q_norm);
+    void* k_norm_ptr = (void*) OPTPTR(k_norm);
+    bool norm_fp16 = true;
+    bool norm_bf16 = false;
+    if (q_norm_ptr)
+    {
+        TORCH_CHECK_DIM(q_norm.value(), 1);
+        TORCH_CHECK(q_norm.value().size(0) == head_dim, "q_norm is incorrect size");
+        norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
+        norm_fp16 = q_norm.value().dtype() == at::kHalf;
+        if (k_norm_ptr)
+            TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
+    }
+
+    int warps = CEIL_DIVIDE(head_dim / 2, 32);
+    int thr = warps * 32;
+    int parallel_heads = MIN((MAX_NUM_THREADS / thr), num_heads_q + num_heads_k);
+    // Enough z-blocks that each covers one head-group iteration; scale down when the
+    // token-level grid already fills the device
+    int head_groups = CEIL_DIVIDE(num_heads_q + num_heads_k, parallel_heads);
+    if (seq_len * bsz >= 32) head_groups = 1;
+    dim3 blocks(seq_len, bsz, head_groups);
+    dim3 threads(thr, parallel_heads);
+
+    #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, \
+                 seq_len, num_heads_q, num_heads_k, head_dim, q_head_stride, k_head_stride, partial_head_dim, position, positions_ptr, \
+                 position_ids_ptr, attn_factor, q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, \
+                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, position_ids_stride, rotate_dims, rotate_offset
+
+    // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 14 (the
+    // GP_rope_positions record site)
+    #define ARGPTRS &q_ptr, &out_q_ptr, &k_ptr, &out_k_ptr, &inv_freq_ptr, &bsz, \
+                 &seq_len, &num_heads_q, &num_heads_k, &head_dim, &q_head_stride, &k_head_stride, &partial_head_dim, &position, &positions_ptr, \
+                 &position_ids_ptr, &attn_factor, &q_norm_ptr, &k_norm_ptr, &norm_eps, &norm_constant_bias, &inv_freq_table, \
+                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride, &rotate_dims, &rotate_offset
+
+    void* kernel_ptr = nullptr;
+    if (norm_fp16)
+    {
+        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, false>;
+        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, false>;
+    }
+    else if (norm_bf16)
+    {
+        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, true>;
+        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, true>;
+    }
+    TORCH_CHECK(kernel_ptr, "rope: incorrect norm dtype");
+
+    void* kernel_args[] = { ARGPTRS };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
+
+    if (graph)
+    {
+        // All position sources are patchable: the kernel branches on the pointers' null-ness at
+        // runtime, so one captured graph serves scalar/positions/position_ids modes alike
+        graph->record_param(kernel_ptr, GP_rope_inv_freq, 4);
+        graph->record_param(kernel_ptr, GP_rope_position, 13, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 14);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 15);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 25, 4);   // ARGPTRS index of position_ids_stride
+        graph->record_param(kernel_ptr, GP_end, 0);
+    }
+
+    #undef ARGS
+    #undef ARGPTRS
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void rope
+(
+    const at::Tensor& q,
+    at::Tensor& out_q,
+    const c10::optional<at::Tensor>& k,
+    c10::optional<at::Tensor>& out_k,
+    const at::Tensor& inv_freq,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    int rope_mode,
+    float attn_factor,
+    const c10::optional<at::Tensor>& q_norm,
+    const c10::optional<at::Tensor>& k_norm,
+    float norm_eps,
+    float norm_constant_bias,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    int rotate_dims,
+    int rotate_offset
+)
+{
+    rope_gr(q, out_q, k, out_k, inv_freq, position, positions, position_ids, rope_mode,
+            attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, llama_4_scaling_beta,
+            llama_4_scaling_original, rotate_dims, rotate_offset, nullptr);
+}
+
+
+int64_t gen_mrope_pos_ids
+(
+    at::Tensor mrope_pos_ids,
+    at::Tensor ids,
+    int merge_size,
+    const std::vector<std::tuple<int64_t, int64_t>> &spans,
+    const std::vector<std::tuple<int64_t, int64_t, int64_t>> &grids
+)
+{
+    int max_length = mrope_pos_ids.size(1);
+    int in_length = ids.size(0);
+
+    int64_t* in_ids = (int64_t*) ids.data_ptr();
+    int64_t* pos_ids = (int64_t*) mrope_pos_ids.data_ptr();
+
+    int64_t* out_t = pos_ids;
+    int64_t* out_h = pos_ids + max_length;
+    int64_t* out_w = pos_ids + 2 * max_length;
+
+    int64_t base_t = 0;
+    int64_t next_base_t = 0;
+
+    for (int i = 0; i < max_length; ++i)
+    {
+        bool is_emb = false;
+        if (i < in_length)
+        {
+            int64_t id = in_ids[i];
+
+            for (int j = 0; j < spans.size(); ++j)
+            {
+                int64_t span_start = std::get<0>(spans[j]);
+                int64_t span_end = std::get<1>(spans[j]);
+                int64_t span = span_end - span_start;
+                if (id >= span_start && id < span_end)
+                {
+                    is_emb = true;
+                    int64_t k = id - span_start;
+                    int64_t grid_t = std::get<0>(grids[j]);
+                    int64_t grid_h = std::get<1>(grids[j]) / (int64_t)merge_size;
+                    int64_t grid_w = std::get<2>(grids[j]) / (int64_t)merge_size;
+                    int64_t k_t = base_t + (k / grid_w / grid_h) % grid_t;
+                    int64_t k_h = base_t + (k / grid_w) % grid_h;
+                    int64_t k_w = base_t + k % grid_w;
+                    *out_t++ = k_t;
+                    *out_h++ = k_h;
+                    *out_w++ = k_w;
+                    // DBGI3(k_t, k_h, k_w);
+                    next_base_t = std::max(next_base_t, k_t + 1);
+                    next_base_t = std::max(next_base_t, k_h + 1);
+                    next_base_t = std::max(next_base_t, k_w + 1);
+                    break;
+                }
+            }
+        }
+        if (!is_emb)
+        {
+            base_t = next_base_t;
+            *out_t++ = base_t;
+            *out_h++ = base_t;
+            *out_w++ = base_t;
+            // DBGI3(base_t, base_t, base_t);
+            base_t++;
+            next_base_t = base_t;
+        }
+    }
+
+    return next_base_t;
+}
+
+// Llama-4 position-dependent attention scale on full query rows (Ministral/Mistral-4 family:
+// HF multiplies query_states by 1 + beta * ln(1 + pos // original_max) after rope, queries
+// only). The fused rope kernel covers full-rotation attention; MLA rotates only the q_pe
+// slice, so its graph path scales the whole (possibly padded) q row with this kernel instead,
+// before the pe-gather and absorb stages. The scale is rounded to fp16 first so the result
+// matches the module's eager-path (torch) multiply bitwise.
+
+__global__
+void l4_scale_q_kernel
+(
+    half* __restrict__ q,
+    const int seq_len,
+    const int row_width,
+    const int row_stride,
+    const int position,
+    const uint32_t* __restrict__ positions,
+    const uint32_t* __restrict__ position_ids,
+    const float llama_4_scaling_beta,
+    const int llama_4_scaling_original,
+    const int position_ids_stride
+)
+{
+    int row = blockIdx.y;
+    int batch = row / seq_len;
+    int token_pos = row % seq_len;
+    int pos = token_pos + position;
+    if (positions)
+        pos = token_pos + positions[batch];
+    else if (position_ids)
+        pos = position_ids[(batch * seq_len + token_pos) * position_ids_stride];
+
+    float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
+    scaling = __half2float(__float2half_rn(scaling));
+
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= row_width / 2) return;
+    half2* ptr = (half2*) (q + (int64_t) row * row_stride) + t;
+    half2 v = *ptr;
+    *ptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+}
+
+void l4_scale_q_gr
+(
+    at::Tensor& q,
+    int bsz,
+    int seq_len,
+    int row_width,
+    int row_stride,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    int position_ids_stride,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK(row_width % 2 == 0 && row_stride % 2 == 0, "l4_scale_q: widths must be even");
+    TORCH_CHECK(row_width <= row_stride, "l4_scale_q: row_width exceeds row_stride");
+
+    void* q_ptr = (void*) q.data_ptr();
+    const uint32_t* positions_ptr = (const uint32_t*) OPTPTR(positions);
+    const uint32_t* position_ids_ptr = (const uint32_t*) OPTPTR(position_ids);
+    int ipos = (int) position;
+
+    int threads = 256;
+    dim3 blocks(CEIL_DIVIDE(row_width / 2, threads), bsz * seq_len);
+
+    void* kernel_ptr = (void*) l4_scale_q_kernel;
+    void* kernel_args[] =
+    {
+        &q_ptr, &seq_len, &row_width, &row_stride, &ipos, &positions_ptr, &position_ids_ptr,
+        &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride
+    };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, dim3(threads), kernel_args, 0, stream));
+
+    if (graph)
+    {
+        graph->record_param(kernel_ptr, GP_rope_position, 4, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 5);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 6);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 9, 4);
+        graph->record_param(kernel_ptr, GP_end, 0);
+    }
+
+    cuda_check(cudaPeekAtLastError());
+}

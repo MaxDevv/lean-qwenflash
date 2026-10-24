@@ -1,0 +1,989 @@
+# Environment variables
+
+Runtime and build-time toggles recognized by ExLlamaV3. All of these have sensible defaults;
+they exist mainly for A/B testing, debugging and working around platform quirks.
+
+Boolean-ish variables treat `0` as off and any other value as on unless noted. C++-side
+variables are read once (on first use) and cached; Python-side variables are read at import
+time. Either way, set them before loading a model.
+
+A few defaults differ between the CUDA and ROCm builds. They are collected in
+`exllamav3/util/backend.py` (the C++ side holds the same values where it reads a variable itself):
+
+| Variable | CUDA | ROCm | Why |
+|---|---|---|---|
+| `EXL3_QKV_SLICE` | `1` | `0` | the RDNA multi-matrix GEMV has no sliced form |
+| `EXL3_INT8_GEMV` | `2` | `0` | the RDNA fdot2 GEMVs are faster at these shapes |
+| `EXL3_MOE_FUSED_ROWS` | `128` | `512` | the RDNA fused MoE kernel tiles the rows itself |
+| `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
+| `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
+| `EXL3_HC_FOLD` | `0` | `1` | the per-launch cost dominates the mHC decode kernels on RDNA |
+
+## Attention
+
+### `EXL3_GRAPHS` (default: `1` on CUDA, `0` on ROCm)
+
+Whether the decode paths capture their kernel sequences into device graphs and replay them. With
+`0` every graphed site (attention, MLA, GDN, the MLP and block-sparse decode kernels) runs the same
+C++ launch sequence eagerly on each call, kernels and order unchanged, so the switch changes only
+host submission. On CUDA replay is a few percent faster at decode. On ROCm the HIP runtime launches a
+graph node no faster than a plain kernel, the measured difference is within noise, and every
+instantiated graph exec reserves a 2 MB device-side kernel-argument pool that grows with each
+parameter update until the exec is destroyed (an open HIP runtime issue); a speculative-decoding
+server holds hundreds of execs, so disabling graphs there also frees over a gigabyte of VRAM.
+Set `EXL3_GRAPHS=1` on ROCm to test the graph path.
+
+### `EXL3_BC_ATTN` (default: `1`)
+
+Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
+block -- q/k/v projections, fused head norm + RoPE, cache append, flash-decoding attention and
+o_proj -- runs as a single C++ call, captured as one CUDA graph per (bsz, q_len) shape and
+replayed with only the input/output/position/block-table pointers patched. Removes effectively
+all Python host time from the attention block; the largest gains are on host-bound setups
+(small or hybrid models, fast GPUs, contended CPUs). The same flag covers the equivalent path
+for MLA layers (BC_MLAttention: q projections, latent projection and staging, partial RoPE,
+W_UK absorption, cache append, absorbed flash-decoding, W_UV unfold and o_proj as one graph).
+
+Module or cache configurations the path does not support (TP, headwise gates, LayerNorm or
+span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...) fall back to
+the regular dispatch path by design. Unexpected errors while building the path are raised, not
+swallowed. Set to `0` to disable the path entirely.
+
+### `EXL3_BC_ATTN_TRACE` (default: `0`)
+
+Print one line per attention module/cache-layer pair when the graph-captured decode path is
+built or declined (module key, device). Activation check for A/B tests: a benchmark comparing
+`EXL3_BC_ATTN` settings is only meaningful if the enabled run actually built the path.
+
+### `EXL3_BC_DSA` (default: `1`)
+
+DeepSeek-V4 counterpart of `EXL3_BC_ATTN`: for decode steps (bsz 1, q_len ≤ 16) the whole DSA
+attention step runs as one graph-captured C++ call: the batched x-side projection fan, fused
+head-norm RoPE, both compressor updates (compressed/indexer entry pools and rings), the
+lightning-indexer scoring and capture-safe top-k selection (long-context regime), the
+flash-decoding sparse attention with fused output de-rotation, the grouped o_proj and the
+sliding-window ring append. One graph per (cache layer, job slot, q_len, dense/top-k regime);
+position flows through shared device scalars (one 8-byte host write per step per job) plus a
+handful of patched scalar node parameters (live pool width, causal bounds), so replays never
+rebuild anything. Steps that need a host-side window ring shift or rebase (page-granular, rare)
+decline to the eager path for that step, as do ineligible layer configurations (non-EXL3
+projections, ...) permanently. Set to `0` to force the eager path everywhere.
+
+### `EXL3_BC_MLA` (default: `1`)
+
+MLA counterpart of `EXL3_BC_ATTN`: decode steps (q_len ≤ 16) of an MLA layer run as one
+graph-captured C++ block (projections, absorb, latent attention, unfold, o_proj). Set to `0` to
+force the eager dispatch path, for A/B testing.
+
+### `EXL3_MOE_SHARED_COOP` (default: `1`)
+
+MoE layers with a shared expert run it, at decode batch sizes, as a one-expert launch of the fused
+expert kernels (at the shared expert's own bit width) instead of the three separate GEMV launches
+of its own graph; the routed launch merges the result as before. Applies to EXL3-quantized gated
+shared experts with 128-aligned widths and no post-norm. Under tensor parallelism such a shared
+expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
+rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
+
+### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
+
+Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
+(up to 32 rows): a site's residual update (`hc_apply`) is deferred and run inside the next site's
+mix kernel, and the RMSNorm that follows a mix runs inside the mix's finalize kernel, two launches
+fewer per site. The folded kernels repeat the unfused kernels' arithmetic in the same order, so
+the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default on ROCm, where
+the per-launch cost is a large part of these small kernels; `1` enables it on CUDA as well.
+
+### `EXL3_GR_MIX_TILED` (default: `1`)
+
+Prefill-sized mixes of the Qwen3.8-style gated residual (`GatedResidual`, the low-rank
+hyper-connection) run a tiled CUDA kernel whose GEMMs use exact int8 tensor-core accumulation with
+a fixed fp32 combination, so the result is bit-identical on every GPU architecture and
+tensor-parallel ranks compute identical streams (a prerequisite for replicating decisions such as
+MoE routing across ranks instead of broadcasting them). Precision matches the fp16 path and it is
+faster than the cuBLAS path it replaces. Set to `0` to fall back to the cuBLAS GEMM path
+(device-dependent kernel choice, not rank-consistent). Decode-sized mixes use the fused `gr_mix`
+kernel either way. Both kernels read the one resident fp16 table set; the tiled path derives its
+int8 operands from it per call (a deterministic per-row split, so the same bytes every call),
+and the decode kernel takes the norm weight on the stream side, written by the preceding site's
+residual update. The same int8 scheme covers the MoE router projection for batched rows
+(`routing_gemm.cu`), which has no switch.
+
+On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.cuh`). The
+per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
+agree across RDNA generations as well.
+
+### `EXL3_BC_GDN` (default: `1`)
+
+Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:
+the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
+force the torch path, for A/B testing.
+
+### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
+
+Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges
+of this many tokens, carrying the fp32 recurrent state between them. The projections and the
+convolution still run at the full chunk size; only the scan's temporaries (about 112 KB per
+token at 48 value heads of 128) shrink from the chunk to the sub-range, e.g. 1.5 GB to 0.7 GB
+per layer at a 16k chunk. The result is bit-identical to a single pass, and 2048 is also the
+fastest setting measured (1024 costs about 40% more on the scan). Set to `0` to run the whole
+chunk in one pass.
+
+### `EXL3_GDN_PROJ_FP32` (default: `0`)
+
+Prefill of a gated-delta-net / KDA layer takes its q/k/v projection out of the GEMM in fp16
+instead of fp32; the values are converted to bf16 for the recurrence either way, and the
+projections stay below |100| on natural text. Set to `1` for the fp32 projection (about
+0.5-2.5e-3 relative difference in the layer's output, 1.5 GB less transient per 16k rows on
+GLM-5.3).
+
+### `EXL3_GDN_GATE_FP32` (default: `1`)
+
+KDA's forget-gate and beta projections (the inputs to the per-channel decay) stay fp32. Set to
+`0` for fp16: 256 MiB less per 16k rows on GLM-5.3, about 1e-3 relative difference in the
+layer's output.
+
+### `EXL3_GDN_CONV_TOKEN_MAJOR` (default: `1`)
+
+The prefill short convolution reads the projection output in place (token-major, any float
+dtype) instead of a transposed bf16 copy of it. Same kernel arithmetic; a bf16 projection is
+bit-identical to the copy, an fp16 one skips its bf16 rounding. Set to `0` for the copy.
+
+### `EXL3_PLE_SUB_CHUNK` (default: `1024`)
+
+Prefill of the PLE (n-gram) layer runs its fused stream pass in row slabs of this many tokens,
+carrying the short-conv state between slabs and adding each slab's result into the stream in
+place. The pass holds several full-width fp32 working tensors of the stream stack so the slab 
+bounds that. 1024 is the fastest slab measured. Set to `0` to run the chunk whole.
+
+### `EXL3_BC_DSA_DEBUG` (default: `0`)
+
+Raise errors encountered while building the graphed DSA path instead of silently declining to
+the eager path. Diagnostic for why a configuration falls back.
+
+### `EXL3_DSV4_NO_XFAN` (default: `0`)
+
+Set to disable the eager DSA path's projection fans. With the fans, the x-side projections that
+share the block input (q_a, wkv, and the compressor/indexer kv/gate pairs) run as a single
+per-matrix-N batched MGEMM, and q_b pairs with the indexer query projection over q_res the same
+way in the top-k regime: six to eight GEMV launches collapse into two. A/B switch for the
+eager path only; the graphed path (`EXL3_BC_DSA`) builds its own fan and is not affected.
+Layers whose projections mix quantization formats or bitrates decline the fan by themselves.
+
+### `EXL3_QC_STAGING` (default: `1`)
+
+How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only
+affects quantized caches.
+
+- `0` - no staging: packed cache tensors feed the prefill and decode kernels directly, with
+  dequantization fused into the kernel loads. Lowest memory: no staging scratch is ever
+  allocated, and nothing extra is reserved during autosplit loading. Prefill pays for the
+  in-kernel expansion (roughly 5–25% on the attention kernel depending on bitrate and GPU),
+  which every kv tile repeats once per query block and sibling query head.
+- `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
+  cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
+  quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
+  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
+  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
+  pass, so the space is reserved at load time rather than discovered at the first long prefill.
+  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
+  1M tokens with 8 kv heads of dim 128).
+- `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
+  full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
+  `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
+  decode path reads the packed cache directly.
+
+### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
+
+Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
+this keep the direct path, which reads less global memory (relevant for short trailing chunks
+over long contexts at low cache bitrates). Tuning/testing knob.
+
+### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
+
+Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of
+{1, 2} is measured once per (shape family, device) at first use; a nonzero value pins it,
+skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
+or short chunks below the threshold above).
+
+### `EXL3_TRITON_SMEM_LIMIT` (default: unset)
+
+Caps the dynamic shared memory per block that the Triton attention kernels believe the device
+grants. The kernels' tile configs are sized for Ampere-class budgets; each launch site lists a
+ladder of smaller configs and takes the first whose compiled footprint fits the device (Turing:
+64 KB). Setting a limit below the real one walks the ladders on any GPU, which is how the
+stepped-down configs are exercised without the smaller hardware. Note the picks then reflect
+this device's footprints, which differ from the target architecture's. Debugging only.
+
+### `EXL3_TRITON_SMEM_DEBUG` (default: `0`)
+
+Prints every ladder probe (kernel, config, measured footprint, fits or over) and every graph
+kernel that declines to the eager path for lack of shared memory.
+
+### `EXL3_MLA_PREFILL` (default: `mha`)
+
+Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the compressed cache
+and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
+single-kernel absorbed-form prefill for A/B testing.
+
+### `EXL3_PREFER_FA2` (default: `0`)
+
+Put the flash-attn-2 backends ahead of the built-in Triton attention kernels in the dispatch
+order. flash-attn is an optional dependency; when it is not installed, this switch is ignored
+(with a warning) and the built-in kernels serve everything. The Triton kernels match or beat
+FA2 across supported hardware and cover more cases (quantized caches, head dims > 256,
+attention sinks); this switch exists for A/B comparison.
+
+## EXL3 GEMM / GEMV
+
+### `EXL3_GEMV` (default: `1`)
+
+QTIP-style small-m fp16 GEMV path, dispatched from the main GEMM entry point when the shape
+heuristic applies. `0` disables, `1` uses the measured heuristic envelope (default), `2` forces
+the path wherever its hard constraints allow (testing).
+
+### `EXL3_GEMV_SMEM` (default: `-1`)
+
+Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
+forces shuffle extraction, `1` forces shared-memory staging. Testing only.
+
+### `EXL3_INT8_GEMV` (default: `2`)
+
+Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch
+covering the input Hadamard, activation quantization, dp4a GEMV and output Hadamard. `2`
+(default) is the plain int8 mode, `1` the error-feedback residual mode (~15–16 bit effective
+activation precision, slightly slower), `0` disables the path.
+
+Tensors quantized with other codebooks are unaffected and keep their regular kernels. When the
+mode is enabled, gate/up (and other same-input) tensor pairs that the int8 path can take are
+also *unfused* from the batched MGEMM when each matrix is wide enough to fill the GPU on its
+own. See the two thresholds below. The graphed decode paths (BC modules) handle both the fused
+and unfused configurations.
+
+### `EXL3_INT8_GEMV_MAX_K` (default: per-arch)
+
+Highest bitrate K the int8 GEMV path accepts; above it the regular fp16 kernel runs instead.
+The default is 6 on Hopper and Blackwell and 5 elsewhere: Ampere is DRAM-bound from K = 6 up,
+where the int8 path's reduced per-weight compute no longer helps (and Ada is marginal there),
+but on Hopper the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced
+to test the crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
+automatically.
+
+### `EXL3_MGEMM_K_THRESHOLD` (default: per-arch), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
+
+Unfusing heuristics applied when the int8 GEMV mode is enabled, to mul1 tensor pairs only: keep
+the fused MGEMM when the bitrate K is at or above the K threshold (the int8 path declines those
+anyway), or when the matrices are narrower than the N threshold (too narrow for separate GEMV
+calls to fill the GPU; batching is what restores utilization there). The K threshold defaults
+to one above the int8 path's per-arch K cap (see `EXL3_INT8_GEMV_MAX_K`); setting it explicitly
+pins it on every device.
+
+### `EXL3_NO_FUSED_RECONSTRUCT` (default: `0`)
+
+Set to disable original-basis weight reconstruction on the hgemm prefill path. Long inputs to
+EXL3 linears run reconstruct-then-GEMM; by default the reconstruct kernel emits the weights in
+the original basis. Both 128-point Hadamard transforms and the sign vectors are folded into
+the (memory-bound) reconstruct kernel's shared-memory epilogue, so the GEMM runs on the raw
+input and the standalone input/output Hadamard launches disappear (previously ~14% of
+long-chunk prefill GPU time; ~+6-7% prefill throughput on DeepSeek-V4-Flash). The fused kernel
+does k·n-proportional extra work while the saved Hadamard traffic scales with rows·(k+n), so it
+engages at 1024+ input rows (breakeven is ~400–900 depending on shape); below that, and for the
+per-expert MoE dequant path (small row counts per expert), the rotated-basis pipeline
+(input Hadamard → GEMM → output Hadamard) is kept. Set to `1` to force the rotated-basis
+pipeline everywhere, for A/B testing.
+
+### `EXLLAMAV3_TUNE_CACHE` (default: platform cache dir)
+
+Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
+selection results, persisted across runs).
+
+## Sampling
+
+### `EXL3_FUSED_SAMPLER` (default: `1`)
+
+Collapse eligible sampler stacks into fused kernels at sampler construction. Stacks ending in
+greedy or temperature/min-P/top-K/top-P/Gumbel steps (in the orders emitted by the preset
+samplers, optionally preceded by repetition/presence/frequency penalties) run as a few custom
+kernels working directly in logit space, instead of the step-by-step softmax/sort pipeline.
+Collapsed temperature/min-P stacks sample the same token as the uncollapsed reference for the
+same seed, up to float rounding at exact ties; top-K/top-P stacks keep the same token set as
+the sort-based reference (ties at the exact cutoff are all kept) but draw their Gumbel noise by
+token id rather than sorted position, so individual seeds map to different samples from the
+same distribution. Stacks the collapse does not recognize fall back to the step-by-step path by
+design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
+reference implementation.
+
+## CPU MoE offload
+
+Experimental: `-mcl`/`--moe_cpu_offload` (main model) and `-dmcl`/`--draft_moe_cpu_layers`
+(draft model or MTP head) run the routed experts of the first N block-sparse MoE layers on the
+CPU, expert weights resident in system RAM, freeing the VRAM those layers' experts would have
+used. Layer-split mode only; requires mul1-codebook experts, K ≤ 8, and uniform per-expert
+biases (all or none; ineligible layers fall back to the GPU as usual). A spawned worker process
+per model component (main / draft / MTP) owns its own expert weights and a job ring in pinned
+shared memory; the parent's forward pass never blocks on the CPU. During prefill, hot experts
+additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
+dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
+thread configuration, and the knobs below for tuning the split.
+
+These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
+from the environment at import); for a same-process sweep, mutate fields on the module-level
+`TUNING` singleton before constructing a model instead of setting env vars.
+
+### `EXL3_MOE_CPU_OFFLOAD` (default: `0`)
+
+Fallback value for when `-mcl` is not set.
+
+### `-mclt` / `--moe_cpu_threads`, `-dmclt` / `--draft_moe_cpu_threads` (CLI, not env)
+
+Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
+`draft_moe_cpu_threads`. Takes precedence over `EXL3_MOE_CPU_THREADS` below when set.
+
+### `EXL3_MOE_CPU_THREADS` (default: physical cores minus `EXL3_MOE_HOST_CORES`; `cpu_count // 2` if that is `0`, pinning is off, or the topology is unreadable)
+
+Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
+
+### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
+
+Compute job-ring depth and rows per slot (the CPU-tail chunk size). Each slot holds one
+in-flight chunk of the D2H-staged input, selected experts and routing weights, and the
+H2D-staged fp32 output.
+
+### `EXL3_MOE_CPU_WSLOTS` (default: `2`), `EXL3_MOE_CPU_WSLOT_MB` (default: `32`)
+
+Depth and per-slot size of the pinned/VRAM weight-staging ring used by GPU-streamed prefill.
+Each slot must be large enough to hold a batch of streamed experts' packed weights (see
+`EXL3_MOE_STREAM_BATCH_EXPERTS`); if not, the batch is capped by capacity instead.
+
+### `EXL3_MOE_CPU_STAGE_THREADS` (default: `4`)
+
+Memcpy threads used by the worker's dedicated stager (which packs streamed experts' weights
+into the pinned staging ring, concurrently with the compute pool working the CPU tail). A few
+threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
+models with many small experts (see issue trace on Qwen3.6-35B-A3B).
+
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+
+Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
+streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
+inversely with the measured pinned→device bandwidth (probed once per device): a chipset-attached
+x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. On
+Windows the driver drops an idle link to Gen1, so the probe keeps traffic on it for at least
+0.5 s and until the rate is steady. Setting this explicitly pins the threshold on every device
+and disables the bandwidth scaling.
+
+### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
+
+Maximum per-expert assignment count eligible for the fused `exl3_moe` GPU kernel (one launch
+covers a whole batch of experts, up to three with the row tiles of `EXL3_MOE_MTILE`); above
+this an expert still streams but runs through the batched reconstruct tier
+(`EXL3_MOE_STREAM_BATCH_RECON`) or the per-expert reconstruct path instead. Same eligibility as
+the GPU-resident fused path otherwise (mul1, silu/gelu gated or relu2 gateless, no per-expert
+biases, no padded dims); ineligible layers use the reconstruct path for every streamed expert
+regardless of count. The default was 512 while the alternative above it was the per-expert
+loop; with the batched tier there, 128-256 measure best (Qwen3.8 4090 + 3090 split, 4k
+chunks: 512 -> 256 +4%; mistral-small-4 119B full offload on the PRO 6000: +2.8%), and the
+fused temp buffers (concurrency x T x (2 hidden + 2 intermediate) x 2 bytes per device) halve.
+
+### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
+
+Prefill chunk size floor below which GPU streaming never engages and every expert runs on the
+CPU tail as usual (decode, at 1 row per pass, always stays under this).
+
+### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`, max `256`)
+
+Experts packed per weight-staging batch (one stage job, one DMA, and, below
+`EXL3_MOE_STREAM_FUSED_T, one fused-kernel launch). Further capped by staging-slot capacity
+(`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size). The hard ceiling of 256 is
+the structural size of the job descriptor's expert-id array; raising the ceiling itself costs
+only a small amount of shared-memory overprovisioning, not runtime.
+
+### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
+
+Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `bw`/`avx512bw`,
+`vnni`/`avx512`, or `vbmi`, for testing a lower-tier kernel path on hardware that supports
+better. The `bw` tier covers AVX-512F/BW/VL hardware without VNNI (Skylake-SP/X: 1st-gen Xeon
+Scalable, Core-X), which previously fell through to `avx2`: the `vnni` dword kernel with the
+AVX2 tier's vpmaddubsw/vpmaddwd accumulate, ~1.5x the `avx2` tier's cold-expert decode
+throughput on a Xeon Gold 6148. The `vbmi` tier
+(AVX512-VBMI byte-gather state extraction, Zen 4+ / Ice Lake+; Cascade/Cooper Lake have VNNI
+without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
+bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
+Read once per process (parent and worker independently), so it must be set before either is
+started. Note that capping below `bw` also disables the swizzled weight layout (see
+`EXL3_MOE_CPU_SWIZZLE`).
+
+### `EXL3_MOE_CPU_WIDE` (default: `1`)
+
+The CPU expert kernels take int8 activations, scaled per row to the row's largest element. A row
+that is a few large elements over many small ones loses the small ones at that scale. Models
+whose early layers feed every expert a large component shared by all tokens, confined to a few
+dimensions, produce such rows: what distinguishes one token from the next is in the small
+elements, and the experts' gates, held deep in saturation by the shared component, turn the
+rounding error of their pre-activation into its exponential. A row of which more than one
+activation in sixteen would round to zero is therefore carried as two int8 rows, the high and
+low part of a 15-bit value, at the cost of a second row in the GEMVs that read it. Rows that
+int8 holds well are computed exactly as before. `0` keeps plain int8 rows throughout, for
+testing. Read once per process (parent and worker independently).
+
+### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
+
+Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
+load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
+(+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
+roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
+leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
+(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
+and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
+with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
+tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
+prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
+unaffected. Set to `0` to keep the native layout.
+
+### `EXL3_MOE_MEMOPS` (default: `1`)
+
+The parent enqueues its wait/publish handshake with the worker as CUDA stream memory operations
+(`cuStreamWaitValue32`/`WriteValue32`, front-end executed: no SM occupancy, no per-op launch
+cost) rather than the older spin-wait kernels. Set to `0` to force the kernel fallback, kept
+around specifically because the memop path is not yet exercised on Windows. The kernel path's
+30-second stall timeout does not apply to the memop path; a dead worker there is instead detected
+by a host-side watchdog that unblocks any pending wait.
+
+### `EXL3_MOE_STREAM_DEBUG` (default: `0`)
+
+Print per-layer and per-batch engagement: streamed bandwidth probe result and threshold, expert
+counts, streamed-vs-tail assignment split, and fused-vs-reconstruct tier split within each
+streamed batch.
+
+### `EXL3_MOE_CPU_PROF` (default: `0`)
+
+Accumulate per-phase wall time in the CPU compute pool and report every 512 jobs. Enabled once
+per worker at startup.
+
+### `EXL3_MOE_ARENA_DEBUG` (default: `0`)
+
+Print each hugepage-arena chunk allocation (size, running total) as the CPU worker loads expert
+weights, and confirmation when the end-of-load `MADV_COLLAPSE` pass (see
+`EXL3_MOE_ARENA_HUGEPAGE`) is issued. The worker copies loaded expert tensors into a small
+number of large (1 GiB) anonymous mappings instead of leaving them as many separate small
+(sub-2MB) allocations, confirmed via `/proc/<pid>/smaps` that the latter cannot be backed by
+transparent huge pages even under system-wide THP=always, since each is its own VMA.
+
+### `EXL3_MOE_ARENA_HUGEPAGE` (default: `1`)
+
+Whether to attempt hugepage promotion for the arena chunks described above. This is done as a
+single `MADV_COLLAPSE` (Linux 6.1+) pass over each chunk *after* all expert weights for every
+offloaded layer have been loaded, deliberately not via a live `MADV_HUGEPAGE` hint during the
+per-layer writes: on hosts where `/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, that
+hint makes the kernel do *synchronous* compaction on first touch of a hinted region once
+easily-compactable free memory runs low, which turns into multi-second stalls per offloaded
+layer partway through a large model's load. The collapse pass runs on a background thread in
+the worker after it has started serving: it copies the whole arena (about 4 GiB/s on a
+7960X when the chunks were faulted as 4K pages, i.e. on `transparent_hugepage/enabled =
+madvise` hosts, plus any compaction the kernel needs first), so it must not sit on the
+startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
+prints how long it took. Set to `0` to skip hugepage promotion entirely.
+
+On Windows there is no post-hoc promotion, so the same flag instead makes each arena chunk
+attempt a `MEM_LARGE_PAGES` `VirtualAlloc` at creation (requires `SeLockMemoryPrivilege` on the
+account, enabled on the worker's token at runtime) and falls back to a plain mapping per chunk
+when large pages cannot be supplied. A failed request is retried at half the size down to
+64 MiB before giving up: Windows large pages need physically contiguous 2 MiB regions, which
+a long-running system can often still supply in smaller runs even when a full 1 GiB chunk
+does not fit -- a fresh boot typically can serve the full size. Later chunks start at the
+size the previous one was served at, and no further attempts are made once the smallest size
+has failed, so a fragmented system does not pay for the search on every chunk.
+
+The privilege is the "Lock pages in memory" user right (Local Security Policy > Local Policies
+> User Rights Assignment, or the same entry in Group Policy). It is not granted to any account
+by default, and a newly granted right only takes effect after signing out and back in.
+Without it nothing changes: the arena uses regular pages and prints nothing.
+
+With it, the arena is committed up front and locked in RAM: large pages are never paged out,
+so that memory is unavailable to everything else for as long as the model is loaded. The
+worker prints one line after loading that states how much of the arena is on large pages, or
+that none could be allocated. Set the flag to `0` to keep the arena on regular pages.
+
+### `EXL3_HGEMM_F16ACC` (default: auto)
+
+GeForce parts run the fp32-accumulator tensor-core MMA at half the rate of the fp16-accumulator
+form (measured 2.00x on the 3090, 4090 and 5090; 1.00x on the RTX PRO 6000). The reconstruct
+(prefill) GEMMs, i.e. the dense `Linear` path above the reconstruct threshold, the per-expert
+and batched MoE reconstruct tiers, run through a kernel (`hgemm_f16acc.cu`) that uses the
+fp16-accumulator MMA and flushes the partial sums into fp32 every 32 elements of K, so the
+accumulation across K stays fp32. `auto` runs a one-time per-device rate probe and enables the
+kernel where the fp16-accumulator MMA is at least 1.5x faster; `1` forces it on, `0` forces
+cuBLAS. Shapes the kernel does not cover (K not a multiple of 64, N not a multiple of 128,
+unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x uses swizzled
+128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
+each 32-term FP16 partial into FP32.
+
+### `EXL3_MOE_COOP_KSPLIT` (default: unset)
+
+Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over
+disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
+on every GPU here, so the default is no split. Testing knob only.
+
+### `EXL3_MOE_COOP_WIDE` (default: unset)
+
+Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces
+the narrow tile (32 columns per block, k split 16 ways), `1` the wide one (128 columns per block,
+4 x 4 warps). Unset picks per stage: wide on Ampere/Ada at every shape, on Blackwell only for
+k >= 4096 or k >= 2048 with 32 or more (token, expert) slots. Testing knob only.
+
+### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
+
+Bit-reproducible MoE prefill. By default the fused MoE kernel adds each expert's weighted
+output into the token row with float atomics, in whatever order the expert groups finish, and
+the batched reconstruct tier accumulates its padded slab with one atomic `index_add_`;
+together these are the only sources of run-to-run nondeterminism on the GPU prefill path
+(Qwen3.8-Flash-Next KL ~2e-2 between identical 4k-token runs, lfm2.5 ~1e-3, Qwen3-30B-A3B
+~3e-4). With `EXL3_MOE_FUSED_DET=1` every assignment of the fused and batched tiers gets a
+slot in one per-call fp32 scratch (`assignments x hidden`, ~320 MB per layer call on
+Qwen3.8 at 4k tokens): the fused kernel stores its weighted outputs there, the batched
+tier's down-projection GEMMs write straight into their slots, and one `exl3_moe_gather` per
+layer sums each token's slots in k order with the routing weights. Identical runs are then
+bit-identical (verified on all three models), and since the GEMM outputs are written once
+and read once either way it costs nothing measurable: Qwen3.8 6198/6219 vs 6164/6178 tok/s,
+lfm2.5 25.9k vs 26.2k, Qwen3-30B-A3B 7304 vs ~7100 (atomic). The remaining atomic user is
+the streamed CPU-offload tier's fused-kernel call. `EXL3_MOE_RECON_DET` only matters where
+the batched tier cannot write into the slot scratch (the streamed tier, or the switch off):
+`1` accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA
+recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice partial dot
+products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
+models is reproducible as well.
+
+### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
+
+Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
+and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down trellis tensors out as
+one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs an expert's block
+straight out of the arena on the copy stream instead of having the worker's stager thread
+memcpy it into the pinned handoff ring first; the stager is the prefill bottleneck on fully
+offloaded models (mistral-small-4 119B, 54 GiB of experts: 4k-token prefill 700 -> 1850 tok/s
+on a gen5 x16 link, decode unchanged within noise). Costs: every chunk is registered with CUDA
+as it appears (~0.2 s per GiB, overlapping the load) and the arena is shared memory counted in
+both processes' RSS. On Linux the chunks are `memfd`s passed over the worker pipe (resolved at
+runtime through libc or the raw syscall when the interpreter was built without
+`os.memfd_create`, as conda builds are); shmem pages
+only get transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
+allows it at allocation time: `within_size` (or `always`) is what works, since the chunks are
+preallocated with `fallocate` and then page-locked by the parent, so neither the `advise` hint
+nor the later collapse pass can convert them (on the default `never` the CPU kernels run on 4K
+pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
+pagefile-backed sections (4K pages); each must fit both free physical RAM and commit headroom
+when it is created, or the load fails naming the chunk.
+
+### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
+
+Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
+held in RAM with `--ngram_ram`): before each one, `MemAvailable` (from `/proc/meminfo`, or
+psutil where that is unavailable, or the available physical RAM from `GlobalMemoryStatusEx` on
+Windows without psutil) must cover the allocation plus this reserve, or the load fails with a
+message naming the allocation. Linux has no allocation-time failure for anonymous or shmem
+memory: an oversized arena only fails once the machine has swapped itself into a minutes-long
+stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at all.
+`0` disables the check. Plain (unpinned) arena chunks on Linux are private anonymous mappings
+that only take RAM for the pages actually written, so for those the guard runs on the bytes
+written, in 256 MiB steps, rather than on each whole 1 GiB chunk: a model whose experts fit no
+longer fails on its last, mostly empty chunk. Pinned (shared memfd, hugetlb) and Windows chunks
+are committed up front and keep the per-chunk check.
+
+### `EXL3_MOE_CPU_LOAD_BATCH` (default: `32`)
+
+Experts the CPU MoE worker reads per deferred-load pass while loading a layer. Each pass goes
+through loader tensors that are then copied into the arena, so this bounds the transient host
+memory on top of the arena to a slice of a layer instead of a whole layer (which is over a GiB
+on 512-expert models). The arena layout and contents do not depend on it. `0` reads the whole
+layer in one pass.
+
+### `EXL3_MOE_ARENA_HUGE` (default: unset)
+
+Linux only. With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlbfs
+pages (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge pages
+(`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
+fails with a clear error otherwise. Rejected on Windows.
+
+### `EXL3_MOE_MTILE` (default: `1`)
+
+Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once
+per 16-row tile, so an expert holding 100 rows re-runs the whole B pipeline seven times. With
+this on, experts with 17-32 rows go through a 32-row-tile instance and experts with more than 32
+rows through a 64-row one, each as its own launch over its expert range (up to three launches
+per layer, largest tile first; a wide instance finishes an expert's remainder with the largest
+smaller tile). The wider tiles are separate kernel instances rather than a runtime switch inside
+one kernel: sharing one 128-register budget between the tiers costs the 16-row path 60-70% on
+Ada / Ampere. Instantiated for the mul1 codebook as N = 128 tile-shape kernels: 30-47% less
+fused-kernel time at 24-128 rows per expert on every GPU generation for Qwen3.8-class shapes,
+and ~20% for dims that are multiples of 256 (gemma4, Qwen3-30B), where they replace the N = 256
+16-row tiling for experts above 16 rows (the N = 256 instance stays for the small-expert
+launch, where it is 10-20% faster). Model level, 4k chunks: Qwen3.8 +10% on the PRO 6000, +3%
+on a 4090 + 3090 split; gemma4-26B +1-4%; Qwen3-30B neutral. Other codebooks and the
+all-fused fast path (no host-side counts) keep the single launch. Outputs are bit-identical to
+the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
+reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
+
+### `EXL3_MOE_TILE_N` (default: `0` = automatic)
+
+`128` keeps the N = 128 tile shape for the fused kernel's 16-row launches on dims that are
+multiples of 256 (which otherwise take the N = 256 instances). Measurement knob; the N = 256
+instance is faster for those launches.
+
+### `EXL3_MOE_FUSED_ROWS_WIDE` (default: `256`)
+
+Fused-tier row capacity per expert for layers that use the wide tiles (see `EXL3_MOE_MTILE`);
+`EXL3_MOE_FUSED_ROWS` still applies to every other layer. With the wide tiles the fused kernel
+beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk on the PRO 6000: 6.87k ->
+7.06k tok/s over 128 rows), at 4 x concurrency x rows x (hidden + intermediate) x 2 bytes of
+static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows).
+
+### `EXL3_MOE_BATCH_RECON` (default: `1`), `EXL3_MOE_STREAM_BATCH_RECON` (default: `1`)
+
+Batched reconstruct tier for prefill (`exllamav3/modules/moe_batch_recon.py`): experts with
+more assigned rows than the fused MoE kernel's capacity (up to the `EXL3_MOE_RECON_TILES`
+budget below) are dequantized and multiplied in count-sorted groups (one pointer-table reconstruct, one
+strided-batched GEMM and one Hadamard launch per projection for the whole group, rows padded
+to the largest expert of the group) instead of one expert at a time, cutting the per-expert
+launch count that dominates many-expert models at large chunk sizes (Qwen3.8-Flash-Next 512
+experts, 8k tokens: +16% prefill). The arithmetic is the same as the per-expert path (fp16
+rotated-basis weights, fp16 activations, fp32 down-projection output; models with fp32
+intermediates such as Gemma 4 keep fp32 gate/up outputs and the activation kernel writes the
+fp16 input of the down projection, as in the per-expert path). `EXL3_MOE_BATCH_RECON`
+covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
+`EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
+
+### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
+
+Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
+fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
+the SM count the strided-batched kernel is much faster (PRO 6000, `k = 2048`: `n = 768` runs
+1.45x faster batched at `m = 1024` and 2.9x at `m = 256`, `n = 1792` breaks even at
+`m = 1024`), while above it the batched cuBLAS kernels are 10-15% slower than the single-GEMM
+ones, and the padded slabs cost traffic that grows with the rows. `EXL3_MOE_RECON_TILES` is
+that tile budget: an expert stays on the per-expert path once its narrowest projection
+(`min(intermediate, hidden)`) would span more tiles, i.e. above `TILES * 16384 / n_min` rows
+(1365 rows for `n = 768`, 512 for `n = 2048`). Measured at 8k tokens on a PRO 6000: lfm2.5
+(`n` 1792/2048) loses 15% with everything batched and 4% at a 1024-row cap, parity at 512;
+Qwen3.8-Flash-Next (`n = 768`) is within 2% for any cap. `0` batches
+every expert; `EXL3_MOE_RECON_MAX_ROWS` overrides the derived row cap directly. The other
+knobs: experts per group; `EXL3_MOE_RECON_PAD`, the padded-to-real row ratio a group may reach
+before the planner starts a new one (groups fill largest expert first, so this splits only
+groups of uneven experts: on Qwen3.8-Flash-Next at 4096 tokens a limit of 1.5 pads 32% of the
+tier's rows, 1.1 pads 8% and is 2% faster overall, beating a batch of 8 at 1.5; lfm2.5 gains
+2-5%); the padded-row budget per group; the dequantized-weight scratch budget, which shrinks
+the group for large expert shapes. `EXL3_MOE_RECON_FOLDED=1` (default) folds both
+Hadamards and the sign vectors into the dequantized weights (the formulation the dense
+`Linear` prefill path uses above 1024 rows): fewer launches, about 4% faster prefill on
+Qwen3.8-Flash-Next, at the cost of rounding the folded weights to fp16, which roughly doubles
+the tier's error against an fp32 reference of the same quantized weights (9.6e-4 vs 4.6e-4).
+Against the unquantized model that difference is invisible: lfm2.5 4.10bpw over 10 x 2048
+tokens scores KL 0.0902 to the HF weights folded and 0.0907 unfolded (top-1 85.2% vs 84.9%,
+perplexity 40.50 vs 40.56). Note that the two modes are far apart from each other on
+routing-sensitive models (Qwen3.8 KL 2e-2, lfm2.5 6e-3) while equally far from the
+baseline, so mode-to-mode distance is not a fidelity measure. `0` selects the activation-side
+Hadamards.
+
+### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
+
+Seconds the parent waits for the CPU worker to signal ready after every offloaded layer has
+been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
+so the default is only a safety net against a wedged worker; raise it on very slow hosts.
+
+### `EXL3_MOE_CPU_PIN` (default: `1` on Windows, `0` on Linux)
+
+Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
+SMT siblings last, instead of leaving placement to the OS scheduler, and reserve cores for the
+host process (`EXL3_MOE_HOST_CORES`). Two workers sharing a physical core, or a worker sharing
+one with the host's spin-waiting threads, becomes the straggler at every per-phase barrier of a
+job. Which side of that trade-off wins depends on the scheduler. On Windows the pinned layout
+with a reserved host core is faster and far steadier than floating threads. On Linux the
+opposite was measured end to end: CFS keeps the workers and the host's spin-waits on distinct
+cores by itself, while a pinned layout cannot adapt to whatever else lands on its cores and so
+settles on a different throughput level each run; unpinned runs are faster and repeatable.
+Hence the per-platform default; set it explicitly to test the other layout. Falls back to no
+pinning if the CPU topology can't be read.
+
+### `EXL3_MOE_HOST_CORES` (default: `1`)
+
+Physical cores kept free of worker threads and reserved for the host process. Only in effect with
+`EXL3_MOE_CPU_PIN` on (the Windows default): the pool then pins one compute thread per physical core; the parent process (the thread driving the
+forward, CUDA's driver threads, an API server's executor threads) is otherwise free to land on a
+worker's logical processor, and a pinned worker cannot move away, so it becomes the straggler at
+every per-phase barrier. The default worker count leaves this many cores free, and once the worker
+has started the host process is confined to them (both SMT siblings). If an explicit thread count
+covers every core, the host is confined to the SMT siblings no worker uses instead, so it never
+shares a logical processor with a worker. Measured on a 12-core Ryzen 9 7900X with an RTX 4090
+(Qwen3.8-Flash-Next, 408 of 512 experts per layer on the CPU): decode 11–32 tok/s with the host
+unpinned, 30–36 tok/s with a reserved core. The placement is planned once per process, from the
+first worker started; workers spawned later (draft model, reload) restore the original mask before
+pinning. `0` disables the reservation and the pinning. Windows applies the mask process-wide
+(single processor group only; boxes with more than 64 logical processors are left unpinned with a
+notice); Linux pins every current thread, and later threads inherit it. Never fails a load: OS
+errors print a notice and leave the host unpinned.
+
+### `EXL3_MOE_HANDOFF_PROF` (default: unset)
+
+Enable GPU/CPU handoff profiling, for debug purposes. 
+
+## Model loading
+
+### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
+
+Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
+setting `PYTORCH_CUDA_ALLOC_CONF`.
+
+### `EXL3_LOAD_ARENA` (default: `1`)
+
+Slab allocation for small weight tensors during (deferred) module loads: tensors up to 16 MB
+are carved out of shared 128 MB per-device blocks (first-fit over the open blocks, so partially
+filled tails are packed by later small tensors) instead of getting one CUDA caching-allocator
+allocation each. MoE models with many small per-expert tensors otherwise shatter the allocator
+into tens of thousands of segments with large reserved-but-unallocated overhead. Unloading a
+module frees its blocks; at most one boundary block shared with a neighboring module stays
+pinned. Set to `0` to fall back to per-tensor allocations.
+
+### `EXL3_NGRAM_STREAM` (default: `1`)
+
+Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
+(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (run-coalesced
+positioned reads into pinned staging — threaded preads on Linux, overlapped `ReadFile` at high
+queue depth on Windows) instead of loading the whole table into system RAM. The quantized table
+is tens of GB, and streaming costs little on SSD-class storage (decode is latency-tolerant at
+~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
+only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
+unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
+`--ngram_ram` in `model_init`-based scripts.
+
+### `EXL3_NGRAM_LOCK` (default: `0`)
+
+Default for `Config.infer_params.ngram_lock`: hold the n-gram embedding table in RAM (as with
+`EXL3_NGRAM_STREAM=0`) and `mlock()` its pages in place, so they are never swapped out or
+reclaimed under memory pressure (a swapped-out row would cost a page-in inside the forward).
+Linux only. The process's `RLIMIT_MEMLOCK` must cover the table (the soft limit is raised to the
+hard limit when that suffices; `ulimit -l unlimited`, `LimitMEMLOCK=infinity` for systemd
+services) or the interpreter needs `CAP_IPC_LOCK`; this is checked before the table loads. Also
+`--ngram_lock` / `-ngl` in `model_init`-based scripts.
+
+### `EXL3_EMBED_STREAM` (default: `0`)
+
+Default for `Config.infer_params.embed_stream_from_disk`: stream the token embedding table from
+disk, gathering only the rows each forward pass touches, instead of holding the table in system
+RAM. Applies to quantized and unquantized tables alike. The generator announces each sampled
+token as soon as it is known, so the row is read while the host finishes the step (Linux; on
+Windows the row is read when the next forward pass asks for it). Also settable per load via
+`config.infer_params.embed_stream_from_disk` or `--embed_disk` in `model_init`-based scripts.
+
+### `EXL3_AUTOSPLIT_WORSTCASE` (default: `1`)
+
+The layer-split autosplit loader measures each module's transient VRAM with one forward of a
+dummy state and keeps that much headroom per device. Some transients don't show in that
+forward: attention/MLA decode statics (QSA/DSA families) and, for block-sparse MoE layers,
+everything that depends on how the real workload routes tokens: the deterministic slot scratch
+(all assignments slotted, `EXL3_MOE_FUSED_DET`), the batched-reconstruct group temporaries,
+and the CPU-offload host's GPU side (per-device weight ring, fused-tier buffers, batched tier
+statics, padded fp32 outputs), which the measuring forward skips entirely. With the switch on,
+these modules allocate and drop an upper bound of those transients inside the measuring window
+(`autosplit_extra_measure`), so the split leaves room for them. `0` restores the plain
+measured forward.
+
+### `EXL3_AUTOSPLIT_PREPARE` (default: `1`)
+
+Before measuring a module's transient memory, the autosplit loader lets the module allocate
+the state it would otherwise create lazily inside the measuring forward and keep for good
+(CPU-offload host buffers, batched-reconstruct tables, decode graph slot statics). Measured
+inside the window, that state would be budgeted twice: as resident memory and again as
+transient headroom. Set to `0` to skip the preparation step, for comparison. With verbose
+loading, the loader prints a notice for any module that still leaves more than a small amount
+resident during its measuring forward.
+
+### `EXL3_AUTOSPLIT_MARGIN_MB` (default: `256`)
+
+The layer-split loader closes a device when its remaining headroom no longer covers the largest
+transient measured on it. Besides the `-gs` budget, the check is made against the device
+itself (free VRAM plus the allocator's reserved-but-unallocated pool): a split value at or above
+the card's size otherwise plans against the several hundred MiB the CUDA context, the loaded
+kernels and other processes hold, and the load passes but the first real forward fails. This
+margin is added on top of the measured transient in that physical check, covering what a real
+forward keeps live around a module (recurrent test states, gathered embeddings, allocator
+slack). `0` disables the margin.
+
+### `EXL3_VISION_PINNED` (default: `0`)
+
+Default for `Config.infer_params.vision_pinned`: store the vision component's linear-layer
+weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing straight from
+a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
+component.
+
+## Multi-GPU
+
+### `EXLLAMA_NO_P2P_COPY` (default: unset)
+
+Controls device-to-device tensor moves (the layer split boundary, draft/MTP heads reading the
+target model's states, sparse-attention selections shared between layers). On some platforms
+the driver reports peer-to-peer access that the PCIe fabric does not deliver, and a direct copy
+silently yields garbage. Unset: the first move between each pair of GPUs probes it (a few
+random floats there and back, checked on the host) and, if the probe fails, every later move
+between that pair bounces through system memory, with a warning printed once. Set to `1`: always
+bounce, no probing. Set to `0`: always copy directly, no probing.
+
+### `EXLLAMA_MASTER_ADDR` (default: `127.0.0.1`), `EXLLAMA_MASTER_PORT` (default: auto)
+
+Rendezvous address and port for the tensor-parallel backend. The port defaults to a free port
+picked at startup.
+
+### `EXL3_TP_ROUTING_CHECK` (default: `0`)
+
+Debug for expert-parallel MoE layers. Routing is normally replicated: every rank holds the router
+and selects experts for itself on the rank-identical residual stream (the deterministic int8 GEMM
+and mix kernels make the streams bit-identical across ranks and architectures), which saves two
+broadcasts per MoE layer per token. With this set, the layers fall back to routing on the output
+rank and broadcasting the selection, while every other rank also routes locally and compares its
+top-k selection and weights with the broadcast one; the mismatch counts (split by row class:
+single-row, other decode-sized, prefill) are printed at exit. Any mismatch means the streams or
+the router differ between ranks, so this is the acceptance test for changes to replicated paths.
+
+### `EXL3_TP_STREAM_HASH` (default: `0`)
+
+Debug: set to N to print a digest of the residual stream after every module on every rank for
+the first N real forward passes (warmup passes excluded), to locate where ranks stop agreeing
+bit for bit.
+
+### `EXL3_TP_NO_FWD_BARRIER` (default: `1`)
+
+Skip the pass-start barrier in tensor-parallel forward passes. The native collectives are each
+ordered by their own stage counters, so the barrier is not required for correctness; skipping it
+saves one spin-kernel launch per rank per pass. Set to `0` to restore the barrier (one aligned
+sync point per pass at the cost of a small amount of GPU spin time).
+
+### `EXL3_TP_NO_FP16_WIRE` (default: `0`)
+
+The native backend's CPU-assisted all-reduce moves fp16 payloads over an fp16 wire when the CPU
+supports F16C (universal on AVX2-era hardware, probed at runtime): exactly-rounded results for
+two ranks, fp16-level rounding beyond, at the same PCIe traffic as the bf16 wire. fp32 payloads
+always use the bf16 wire (fp16 lacks the range for residual-stream outliers). Set to `1` to
+force the bf16 wire for fp16 payloads too, e.g. for A/B comparison.
+
+### `EXL3_TP_NCCL_FP32` (default: `0`)
+
+NCCL backend only: reduce fp32 payloads in fp32 instead of over a bf16 wire (which is what the
+native backend always uses for fp32 sublayer outputs). Exact but roughly twice the reduction
+traffic; for A/B testing of the wire rounding.
+
+### `EXL3_TP_TRACE_WIRE` (default: `0`)
+
+Print a line (once per process) when the fp16 all-reduce wire first activates. Activation check
+for numerics A/B tests: whether the wire engages depends on the model's residual dtype, so a
+comparison is only meaningful if the fp16-wire run actually used it.
+
+### `EXL3_TP_REDUCE_THREADS` (default: number of participating ranks)
+
+Number of threads slicing each large-payload accumulate in the native backend's CPU-reduce
+helper (persistent workers, spin-parked between jobs; both the AVX-512 and the AVX2 path). The
+default of one thread per participating rank covers the cases where a single thread's wire rate
+falls behind: three or more ranks (multiple adds per chunk), PCIe 5.0 links, and hosts limited to
+AVX2. Set to `1` to force the single-threaded accumulate. Decode-size reduces are always
+single-threaded.
+
+### `EXL3_TP_SPIN_RECV` (default: `0`)
+
+Milliseconds each tensor-parallel child worker hot-polls its command pipe after finishing a
+command before falling back to a blocking receive. A blocking receive pays scheduler wake
+latency (tens to hundreds of microseconds, worse with deep C-states) at the start of every
+forward pass; during decode the next command arrives within a few milliseconds, so a short spin
+window (e.g. `4`) catches it with no wake cost, at the price of one busy core per rank for the
+window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
+between the main process and child workers reaching their first kernel launch.
+
+## Debug
+
+### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
+
+Not an ExLlamaV3 variable: it belongs to the ROCm profiler registration layer that torch loads for
+`torch.profiler`. With registration active, the HSA runtime's event thread spins on one CPU core
+from the first device operation until the process exits, including while it is idle. Importing
+`exllamav3` therefore sets it to `0` when it is not already in the environment. Export
+`ROCPROFILER_REGISTER_ENABLED=1` for profiling runs: without registration `torch.profiler` records
+no device events. Ignored by CUDA builds.
+
+### `EXL3_NGRAM_GATHER_PROF` (default: unset)
+
+Windows only: print per-gather statistics from the streamed n-gram table path (unique rows,
+coalesced runs, reads completed synchronously vs left pending, span tasks drained by pool
+workers vs the calling thread). Activation check for the overlapped-`ReadFile` gather when
+validating a streamed-table model on Windows.
+
+### `EXLLAMA_DEBUGLOG_<CATEGORY>` (default: unset)
+
+Enables timestamped debug logging for the given category when the corresponding variable is
+present in the environment. Categories are defined at the call sites (see
+`exllamav3/util/debug.py`); mostly hooks for development.
+
+## Build (JIT extension)
+
+These only matter when the C++/CUDA extension is compiled at import time rather than installed
+prebuilt. `EXLLAMA_EXT_LINEINFO` and `EXLLAMA_EXT_COMPRESS` apply to wheel builds as well.
+
+### `EXLLAMA_EXT_LINEINFO` (default: unset)
+
+Compiles the CUDA kernels with source line tables (`-lineinfo`), for profilers and debuggers that
+attribute samples or faults to source lines. Off by default because the tables make up most of
+the size of the embedded kernel images and have no effect on the generated code.
+
+### `EXLLAMA_EXT_COMPRESS` (default: auto)
+
+The embedded kernel images are stored compressed (`--compress-mode=size`) when the installed nvcc
+supports it (CUDA 12.8 and later). Compression is applied to the finished images, so the kernels
+themselves are identical either way. `0` disables it, which may be needed to run a locally built
+extension on a driver that predates compressed images. `require` makes the build fail when nvcc
+does not offer the option instead of silently building uncompressed; the release wheels are built
+this way.
+
+On ROCm the device code objects are compressed with hipcc's `--offload-compress` (`0` disables it);
+the wheels carry one code object per RDNA family and would be several times larger without it.
+
+### `TORCH_NO_COMPILER_WRAPPER` (default: unset)
+
+torch's own switch: the JIT build puts ccache or sccache (whichever is on PATH) in front of the
+host and device compilers, so a translation unit whose preprocessed input was compiled before is
+taken from the cache; a rebuild of unchanged sources in a fresh extension directory then takes
+seconds. torch does this for CUDA builds; ExLlamaV3 applies the same rule to ROCm builds, where
+torch still skips it over an old hipcc incompatibility that ccache no longer has. The wrapper is
+part of every compile command the build records, so installing or removing it (or toggling this
+variable) rebuilds the extension once.
+
+Header edits rebuild only the translation units that include them on both backends: the HIP
+compile rule torch writes has no dependency file (its comment says `-MD` is unsupported by ROCm,
+which is no longer true of hipcc), so the JIT build adds one.
+
+### `CUDAHOSTCXX` (default: unset)
+
+Host compiler passed to nvcc (`-ccbin`), for systems whose default compiler is too new for the
+installed CUDA toolkit. On Windows, only `setup.py` builds use it; the JIT build prints a notice
+and leaves nvcc on the same `cl.exe` as the C++ sources: that of the active MSVC developer
+environment, or else the default toolset of the newest Visual Studio install, which torch sets up
+with `vcvarsall.bat`. To use another toolset, build from a prompt set up with
+`vcvarsall.bat x64 -vcvars_ver=<version>`.
+
+### `TORCH_CUDA_ARCH_LIST` (default: auto)
+
+Standard PyTorch variable; overrides the compute architectures the extension is built for. When
+unset, ExLlamaV3 derives the list from the GPUs present in the system, so building the extension
+(JIT or setup.py) on a machine with no visible GPU requires it.
+
+## `EXL3_DSA_DEBUG_BOUNDS`
+
+When set to `1`, the JIT DSA attention/indexer kernels compile with device-side bounds
+asserts on every block-table page read and gathered pool index, and the DSA module range-
+checks block-table contents on the host each forward. A violation traps at the faulting
+kernel with the kernel name, source line and bad index instead of corrupting memory or
+faulting asynchronously downstream. Debug tool for paged-pool issues; significant JIT
+overhead (forces Triton debug mode globally), leave unset in production. AOT/BC graph
+kernels are unaffected (compiled with asserts off).
+
+## Quantization
+
+### `EXL3_QT_OPTIMIZED`
+
+Forces the quantizer's dense trellis specializations (`quantize_tiles_optimized.cuh`) on (`1`) or
+off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120; per K and codebook
+on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
+choice also sizes the quantizer's scratch buffers.

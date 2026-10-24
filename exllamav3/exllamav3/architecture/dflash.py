@@ -1,0 +1,370 @@
+from __future__ import annotations
+from typing_extensions import override
+import torch
+
+from ..cache import Cache
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
+from ..modules.arch_specific.dflash import DFlashInputLayer
+from ..modules.attn import prepare_for_attn
+from ..util.device_copy import to_device
+import weakref
+
+from ..util.tensor import get_for_device
+
+# TODO: Support DFlash models trained in Speculators (includes lm_head for speculator with limited vocabulary?)
+
+class DFlashConfig(Config):
+    arch_string = "DFlashDraftModel"
+
+    # Offset from the checkpoint's target_layer_ids to exllamav3 export indices (which denote the
+    # OUTPUT of layer j). The original DFlash release needs +1 (determined empirically); variants
+    # whose reference uses hidden_states[i + 1] (output of layer i) use raw ids
+    tap_shift = 1
+
+    def __init__(
+        self,
+        directory: str,
+        model_classes: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            directory,
+            model_classes or {"text": DFlashModel},
+            **kwargs
+        )
+
+        # Attention params
+        self.head_dim = self.read_cfg(int, "head_dim", None)
+        self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
+        self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
+        self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
+
+        if not self.head_dim:
+            self.head_dim = self.hidden_size // self.num_q_heads
+
+        # MLP params
+        self.assert_cfg(str, "hidden_act", "silu", True)
+        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+
+        # Norms
+        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
+
+        # Layers
+        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
+        self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
+        self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
+        # Block attention direction, as the reference draft reads it: "is_causal" in the checkpoint
+        # config overrides the default of causal on sliding-window layers, bidirectional elsewhere
+        self.is_causal = self.read_cfg(bool, ["is_causal", "dflash_config->is_causal"], None)
+
+        # DFlash. Config keys live under dflash_config-> in the original release, at the top
+        # level in later ones (MuseGlimmerAssistant)
+        self.mask_token_id = self.read_cfg(int, ["dflash_config->mask_token_id", "mask_token_id"], no_default)
+        self.target_layer_ids = self.read_cfg(list, ["dflash_config->target_layer_ids", "target_layer_ids"], no_default)
+        # The offset is per checkpoint and not derivable from the config: gemma4-31b-it-dflash
+        # wants +1 (2.4-2.9 vs 0.3 accepted/round), gemma4-26b-a4b-it-dflash wants 0 (3.2 vs
+        # 0.8), same trainer version. A checkpoint (or its quantized config.json) can pin it with
+        # "tap_shift" under dflash_config or at the top level
+        self.tap_shift = self.read_cfg(int, ["dflash_config->tap_shift", "tap_shift"], self.tap_shift)
+        self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
+        assert len(set(self.target_layer_ids)) == len(self.target_layer_ids), \
+            "DFlash target_layer_ids must be unique"
+        self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
+
+        # Variant switches for drafters other than the original z-lab ones (e.g. MiMo-V2.6's).
+        # Each defaults to the previous behaviour.
+
+        # Learned per-head attention sinks
+        self.attention_sink_bias = self.read_cfg(
+            bool,
+            ["dflash_config->attention_sink_bias", "attention_sink_bias", "add_swa_attention_sink_bias"],
+            None,
+        )
+        if self.attention_sink_bias is None:
+            self.attention_sink_bias = self.stc.has_tensor("layers.0.self_attn.attention_sink_bias")
+
+        # Scale on V, folded into o_proj
+        self.attention_value_scale = self.read_cfg(
+            float, ["dflash_config->attention_value_scale", "attention_value_scale"], None
+        ) or 1.0
+
+        # Learned mask embedding shipped with the drafter, used instead of the target's
+        # embedding row for mask_token_id
+        self.key_mask_embedding = "mask_embedding" if self.stc.has_tensor("mask_embedding") else None
+
+        # RoPE
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+
+        # Vision placeholders
+        self.vision = None
+
+
+    def block_window(self, idx: int) -> tuple[int, int]:
+        """
+        (sliding_window, window_right) for draft layer idx. The reference masks q - k < sw,
+        i.e. self plus sw - 1 past keys; a layer that is not causal within the draft block sees
+        the same span ahead of the query
+        """
+        if self.layer_types[idx] != "sliding_attention":
+            return -1, 0
+        causal = True if self.is_causal is None else self.is_causal
+        return self.sliding_window - 1, 0 if causal else self.sliding_window - 1
+
+
+def dflash_update_kv_from_target(
+    model: Model,
+    target_hidden: list,
+    cache: Cache,
+    params: dict,
+    lengths: list[int] = None,
+):
+    """
+    Update a DFlash-style draft's K/V cache with hidden states extracted from the target model.
+    Shared by every drafter built on the DFlash encoder (fc + hidden_norm over concatenated taps)
+    with plain GQA attention layers: model.input_layer, model.attn_modules and
+    model.config.target_layer_ids are what it reads.
+
+    params:
+        "block_table": torch.Tensor
+        "cache_seqlens": torch.Tensor
+    """
+
+    # Target states arrive in layer execution order. Reorder them only when the checkpoint's
+    # projection expects a different target_layer_ids order.
+    target_layer_ids = model.config.target_layer_ids
+    if target_layer_ids != sorted(target_layer_ids):
+        source_idx = {layer_id: idx for idx, layer_id in enumerate(sorted(target_layer_ids))}
+        target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids]
+
+    # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
+    if lengths is not None:
+        max_length = max(lengths)
+        target_hidden = [t[:, :max_length] for t in target_hidden]
+
+    # Ensure all state snapshots are on the same device
+    device = model.input_layer.device
+    for i in range(len(target_hidden)):
+        target_hidden[i] = to_device(target_hidden[i], device)
+
+    # Projection concatenated states to hidden size, once
+    target_hidden = torch.cat(target_hidden, dim = -1)
+    target_hidden = model.input_layer.proj.forward(target_hidden, {}, out_dtype = torch.half)
+    target_hidden = model.input_layer.norm.forward(target_hidden, {}, out_dtype = torch.half)
+
+    bsz, target_seqlen, dim = target_hidden.shape
+    params["target_hidden_cc"] = target_hidden
+
+    # Update KV layers
+    for layer in model.attn_modules:
+        block_table = get_for_device(params, "block_table", layer.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
+        target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
+
+        # k/v project
+        k = layer.k_proj.forward(target_hidden, params)
+        v = layer.v_proj.forward(target_hidden, params)
+        k = k.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+        v = v.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+
+        # Apply rope and norm to k
+        k, _ = layer.rope.apply(
+            k, None,
+            0,
+            cache_seqlens,
+            None,
+            True,
+            layer.k_norm_tensor,
+            None,
+            layer.norm_eps,
+            layer.norm_constant_bias,
+            None,
+        )
+
+        # Write k, v rows to the paged cache; quantized caches quantize them in place rather
+        # than dequantizing/requantizing full layers
+        cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+
+
+class DFlashModel(Model):
+    config_class = DFlashConfig
+
+    # Encoder tensor keys; overridden by variants with a different namespace
+    key_fc = "fc"
+    key_fc_norm = "hidden_norm"
+
+    def __init__(
+        self,
+        config: DFlashConfig,
+        **kwargs
+    ):
+        super().__init__(config, **kwargs)
+
+        self.input_layer = DFlashInputLayer(
+            config = config,
+            key = self.key_fc,
+            key_norm = self.key_fc_norm,
+            hidden_size = config.hidden_size,
+            target_state_size = config.hidden_size * len(config.target_layer_ids),
+            mask_token_id = config.mask_token_id,
+            rms_norm_eps = config.rms_norm_eps,
+            native_draft_len = config.block_size,
+            key_mask_embedding = config.key_mask_embedding,
+            qmap = "target_hidden",
+        )
+        self.modules += [self.input_layer]
+
+        self.first_block_idx = len(self.modules)
+        self.attn_modules = []
+
+        for idx in range(config.num_hidden_layers):
+            window_left, window_right = config.block_window(idx)
+
+            attn = Attention(
+                config = config,
+                key = f"layers.{idx}.self_attn",
+                layer_idx = idx,
+                hidden_size = config.hidden_size,
+                head_dim = config.head_dim,
+                num_q_heads = config.num_q_heads,
+                num_kv_heads = config.num_kv_heads,
+                rope_settings = config.rope_settings,
+                key_q = "q_proj",
+                key_k = "k_proj",
+                key_v = "v_proj",
+                key_o = "o_proj",
+                qmap = "block.attn",
+                sliding_window = window_left,
+                window_right = window_right,
+                key_sinks = "attention_sink_bias" if config.attention_sink_bias else None,
+                q_norm = RMSNorm(
+                    config = config,
+                    key = f"layers.{idx}.self_attn.q_norm",
+                    rms_norm_eps = config.rms_norm_eps,
+                ),
+                k_norm = RMSNorm(
+                    config = config,
+                    key = f"layers.{idx}.self_attn.k_norm",
+                    rms_norm_eps = config.rms_norm_eps,
+                ),
+                out_dtype = torch.float,
+            )
+            attn.o_proj.weight_scale = config.attention_value_scale
+            self.attn_modules.append(attn)
+
+            self.modules += [
+                TransformerBlock(
+                    config = config,
+                    key = f"layers.{idx}",
+                    layer_idx = idx,
+                    attn_norm = RMSNorm(
+                        config = config,
+                        key = f"layers.{idx}.input_layernorm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    attn = attn,
+                    mlp_norm = RMSNorm(
+                        config = config,
+                        key = f"layers.{idx}.post_attention_layernorm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    mlp = GatedMLP(
+                        config = config,
+                        key = f"layers.{idx}.mlp",
+                        hidden_size = config.hidden_size,
+                        intermediate_size = config.intermediate_size,
+                        key_up = "up_proj",
+                        key_gate = "gate_proj",
+                        key_down = "down_proj",
+                        qmap = "block.mlp",
+                        interm_dtype = torch.half,
+                        out_dtype = torch.float,
+                    ),
+                )
+            ]
+
+        self.last_kv_module_idx = len(self.modules) - 1
+
+        self.modules += [
+            RMSNorm(
+                config = config,
+                key = f"norm",
+                rms_norm_eps = config.rms_norm_eps,
+                out_dtype = torch.half,
+            )
+        ]
+
+        self.logit_layer_idx = None
+        self.caps.update({
+            "uncalibrated_quantize": True,
+            "supports_tp": False,
+            "attach_target": True,
+            "dflash_draft": True,
+            "default_draft_size": config.block_size - 1,
+            "autosplit_load_fwd": False,
+        })
+
+        self.attached_model = None
+
+        self.draft_verifier_params.update({
+            "export_state_layers": set(config.target_layer_ids),
+        })
+
+
+    def attach_to(self, target):
+        self.attached_model = weakref.ref(target)
+        self.input_layer.attached_model = weakref.ref(target)
+
+
+    def update_kv_from_target(
+        self,
+        target_hidden: list,
+        cache: Cache,
+        params: dict,
+        lengths: list[int] = None,
+    ):
+        dflash_update_kv_from_target(self, target_hidden, cache, params, lengths)
+
+
+    def sample_from_state(
+        self,
+        state: torch.Tensor,
+        params: dict
+    ) -> torch.Tensor:
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)
+
+
+    def default_load_shape_dtype(self, chunk_size):
+        return (1, 1), torch.long
+
+
+    def default_load_params(self, max_chunk_size):
+        return {}
+
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
+        # flag is only needed when every layer is causal; windowed layers carry their own bounds
+        params["causal"] = self.config.is_causal is True
+        input_ids = prepare_for_attn(input_ids, params)
+        return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        raise NotImplementedError()
+
+
+    @classmethod
+    @override
+    def get_additional_compiled_tensors(cls, config: DFlashConfig) -> dict:
+        # The fc norm is stored in DFlashInputLayer but doesn't match the fc module-key prefix
+        tensors = dict(config.stc.list_tensors(prefix = cls.key_fc_norm))
+        if config.key_mask_embedding:
+            tensors.update(config.stc.list_tensors(prefix = config.key_mask_embedding))
+        return tensors

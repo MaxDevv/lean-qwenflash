@@ -1,0 +1,25 @@
+[11:16:54] kcheck before: CLEAN
+[11:17:10] anonymous pull ok in 16 s
+[11:17:11] image COMMIT 92698604575f789ecc7a2340480413567e6d05c6
+[11:17:23] verify-store rc=0: VERIFY OK: 12384 records, 117.33 GB O_DIRECT re-read + sha256 in 11 s (10.93 GB/s); bad 0 []
+[11:18:39] ready=1 after 76 s
+GATES {'chat': True, 'chat_nothink': True, 'tool_call': True}
+[11:24:24] stream_rate rc=0: generate {"events": 2137, "chars": 11416, "span_s": 147.67, "half_share": 0.509, "tail_share": 0.006, "pass": true} STREAM_RATE PASS 
+[11:25:57] panel: {"positions": 2154, "top1_agreement": 1.0, "mean_kl_top20": 0.0}
+[11:25:58] nv_verify: {"vram_checked":64,"vram_bad":0,"ram_checked":64,"ram_bad":0,"table_bad":0,"rows_stale_nonvram":1497,"home_bad_resident":0,"home_bad_nonresident":0,"ram_resident":4816,"vram_and_ram":0,"pinned":0,"dev_bad_rows":0}
+[11:26:37] kcheck mid: CLEAN
+[12:08:10] sweep rc=0
+prefill 8192: 545.3 tok/s
+prefill 8192: 517.9 tok/s
+prefill 8192: 557.2 tok/s
+prefill 32768: 765.6 tok/s
+prefill 32768: 767.4 tok/s
+prefill 32768: 780.3 tok/s
+decode C1: aggregate 13.70 tok/s, per-stream 13.69
+decode C2: aggregate 14.38 tok/s, per-stream 7.59
+decode C4: aggregate 15.24 tok/s, per-stream 4.30
+decode C1@32k: 12.40 tok/s
+[12:08:12] nv_verify end: {"vram_checked":128,"vram_bad":0,"ram_checked":128,"ram_bad":0,"table_bad":0,"rows_stale_nonvram":6813,"home_bad_resident":0,"home_bad_nonresident":0,"ram_resident":4738,"vram_and_ram":2,"pinned":0,"dev_bad_rows":0}
+[12:08:13] stopped p003-glm53-nvme-smoke
+[12:08:54] kcheck after: CLEAN
+[12:08:54] SMOKE_DONE

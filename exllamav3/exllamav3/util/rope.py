@@ -1,0 +1,540 @@
+from dataclasses import dataclass
+
+import torch
+import math
+from enum import IntEnum
+from ..ext import exllamav3_ext as ext
+
+# Reference:
+# https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/modeling_rope_utils.py
+
+class RopeStyle(IntEnum):
+    NONE = 0
+    GPTJ = 1
+    NEOX = 2
+
+@dataclass
+class RopeSettings:
+    head_dim: int = 128
+    rope_theta: float = 10000.0
+    rope_scaling: dict | None = None
+    rotary_dim: int | None = None
+    partial_rotary_factor: float = 1.0
+    max_position_embeddings: int | None = None
+    original_max_position_embeddings: int | None = None
+    rope_style: RopeStyle = RopeStyle.NEOX
+    override_max_position_embeddings: int | None = None
+    llama_4_scaling_beta: float = 0.0
+    override_type: str | None = None
+    rotate_dims: int = 1
+    # DeepSeek-style YaRN: attn_factor = get_mscale(f, mscale) / get_mscale(f, mscale_all_dim),
+    # paired with the architecture folding mscale_all_dim into sm_scale. Off by default because
+    # non-DeepSeek configs (Mistral) carry the same keys as inert defaults
+    yarn_mscale_ratio: bool = False
+
+    def print(self):
+        print(f" -- RoPE settings")
+        print(f"    head_dim: {self.head_dim}")
+        print(f"    rope_scaling: {self.rope_scaling}")
+        print(f"    rope_theta: {self.rope_theta}")
+        print(f"    rotary_dim: {self.rotary_dim}")
+        print(f"    partial_rotary_factor: {self.partial_rotary_factor}")
+        print(f"    max_position_embeddings: {self.max_position_embeddings}")
+        print(f"    original_max_position_embeddings: {self.original_max_position_embeddings}")
+        print(f"    rope_style: {self.rope_style.name}")
+        print(f"    llama_4_scaling_beta: {self.llama_4_scaling_beta}")
+
+
+def yarn_inv_freq(
+    dim: int,
+    base: float,
+    device,
+    rope_scaling: dict | None = None,
+    factor: float | None = None,
+    original_max_position_embeddings: int | None = None,
+) -> torch.Tensor:
+    """
+    Inverse frequency table for one rope family: plain 1 / base^(2i/dim) when rope_scaling
+    is absent or not yarn, else the HF _compute_yarn_parameters interpolation ramp.
+    Frequency table ONLY -- the yarn attention factor is the caller's concern:
+    RoPE._rope_params_yarn resolves and applies it (legacy HF semantics, including the
+    max_position-derived factor override it passes in explicitly), while DeepSeek-V4 pins
+    it to 1.0 by never applying one and calls this with the raw config dict per rope
+    family (main theta unscaled, compress theta yarn-ramped).
+    factor / original_max_position_embeddings override the dict values when given.
+    """
+    pos_freqs = base ** (torch.arange(0, dim, 2, device = device).float() / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    is_yarn = rope_scaling is not None and \
+        rope_scaling.get("type", rope_scaling.get("rope_type", "default")) == "yarn"
+    if not is_yarn and factor is None:
+        return inv_freq_extrapolation
+    sc = rope_scaling or {}
+    if factor is None:
+        factor = float(sc["factor"])
+    if original_max_position_embeddings is None:
+        original_max_position_embeddings = int(sc["original_max_position_embeddings"])
+    beta_fast = float(sc.get("beta_fast", 32))
+    beta_slow = float(sc.get("beta_slow", 1))
+    truncate = sc.get("truncate", True)
+
+    def find_correction_dim(num_rotations):
+        return (dim * math.log(original_max_position_embeddings / (num_rotations * 2 * math.pi))) \
+            / (2 * math.log(base))
+
+    low = find_correction_dim(beta_fast)
+    high = find_correction_dim(beta_slow)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    if low == high:
+        high += 0.001
+    linear_func = (torch.arange(dim // 2, dtype = torch.float32, device = device) - low) / (high - low)
+    inv_freq_extrapolation_factor = 1 - torch.clamp(linear_func, 0, 1).float()
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+    inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+    inv_freq += inv_freq_extrapolation * inv_freq_extrapolation_factor
+    return inv_freq
+
+
+def _rotate_half_neox(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim = -1)
+
+def _apply_rope_embed_q_neox(q, sin, cos):
+    q = q.transpose(1, 2)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q = (q * cos) + (_rotate_half_neox(q) * sin)
+    q = q.transpose(1, 2)
+    return q
+
+def _apply_rope_embed_qk_neox(q, k, sin, cos):
+    return (
+        _apply_rope_embed_q_neox(q, sin, cos),
+        _apply_rope_embed_q_neox(k, sin, cos)
+    )
+
+
+def _rotate_half_gptj(x):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+def _apply_rope_embed_q_gptj(q, sin, cos):
+    q = q.transpose(1, 2)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q = (q * cos) + (_rotate_half_gptj(q) * sin)
+    q = q.transpose(1, 2)
+    return q
+
+def _apply_rope_embed_qk_gptj(q, k, sin, cos):
+    return (
+        _apply_rope_embed_q_gptj(q, sin, cos),
+        _apply_rope_embed_q_gptj(k, sin, cos)
+    )
+
+
+class RoPE:
+
+    # TODO: Alpha and linear scaling overrides (?)
+
+    def __init__(
+        self,
+        device: torch.device | str,
+        rope_settings: RopeSettings,
+    ):
+        self.device = device
+        self.rope_settings = rope_settings
+
+        self.cached_sin = None
+        self.cached_cos = None
+        self.cached_sincos_max = 0
+
+        self.mrope_interleaved = None
+        self.mrope_section = None
+
+        self.llama_4_scaling_beta = 0.0
+        self.llama_4_scaling_original = 1  # Unused when beta=0
+
+        t = rope_settings.override_type
+        rs = self.rope_settings
+        if not t:
+            if rs.rope_scaling is not None:
+                t = rs.rope_scaling.get("rope_type", rs.rope_scaling.get("type"))
+        # MRoPE sectioning is orthogonal to the scaling type: a multimodal model keeps its
+        # mrope_section next to whatever rope_type it uses (Qwen3.5 with YaRN context extension
+        # as recommended by its model card, for one), so read it before dispatching on the type
+        if rs.rope_scaling:
+            # Two layouts of the three position components over the rotary frequencies: interleaved
+            # (Qwen3-VL, Qwen3.5, Qwen3.8; their configs carry the flag) or contiguous sections (Qwen2.5-VL,
+            # GLM-4V; no flag). HF picks the layout by model class, see get_mrope_freqs
+            self.mrope_interleaved = bool(rs.rope_scaling.get("mrope_interleaved"))
+            self.mrope_section = rs.rope_scaling.get("mrope_section")
+        match t:
+            case None:
+                self._rope_params_default()
+            case "default" | "mrope":
+                self._rope_params_default()
+            case "proportional":
+                self._rope_params_proportional()
+            case "llama3":
+                self._rope_params_llama3()
+            case "linear":
+                self._rope_params_linear()
+            case "yarn":
+                self._rope_params_yarn()
+            case "longrope" | "su":
+                self._rope_params_longrope()
+            case _:
+                raise ValueError(f"Unknown rope_type: {t}")
+
+
+    def _rope_params_default(self):
+        rs = self.rope_settings
+        base = rs.rope_theta
+        dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype = torch.int64, device = self.device).float() / dim))
+        self.inv_freq, self.attn_factor = inv_freq, 1.0
+
+
+    def _rope_params_llama3(self):
+        rs = self.rope_settings
+        self._rope_params_default()
+        factor = rs.rope_scaling.get("factor", 8.0)
+        low_freq_factor = rs.rope_scaling.get("low_freq_factor", 1.0)
+        high_freq_factor = rs.rope_scaling.get("high_freq_factor", 4.0)
+        old_context_len = rs.rope_scaling.get("original_max_position_embeddings", 8192)
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+        wavelen = 2 * math.pi / self.inv_freq
+        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, self.inv_freq / factor, self.inv_freq)
+        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+        smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+        is_medium_freq = (wavelen >= high_freq_wavelen) * (wavelen <= low_freq_wavelen)
+        inv_freq = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+        self.inv_freq, self.attn_factor = inv_freq, 1.0
+
+
+    def _rope_params_linear(self):
+        rs = self.rope_settings
+        self._rope_params_default()
+        factor = rs.rope_scaling.get("factor", 1.0)
+        self.inv_freq /= factor
+
+
+    def _rope_params_proportional(self):
+        rs = self.rope_settings
+        head_dim = rs.head_dim
+        base = rs.rope_theta
+        factor = rs.rope_scaling.get("factor", 1.0) if rs.rope_scaling else 1.0
+        rope_proportion = rs.partial_rotary_factor
+
+        rope_angles = int(rope_proportion * head_dim // 2)
+        inv_freq_rotated = 1.0 / (
+            base ** (
+                torch.arange(0, 2 * rope_angles, 2, dtype = torch.int64, device = self.device).float() / head_dim
+            )
+        )
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = torch.cat(
+                (
+                    inv_freq_rotated,
+                    torch.zeros(nope_angles, dtype = torch.float32, device = self.device),
+                ),
+                dim = 0,
+            )
+        else:
+            inv_freq = inv_freq_rotated
+        self.inv_freq, self.attn_factor = inv_freq / factor, 1.0
+
+
+    def _rope_params_yarn(self):
+        rs = self.rope_settings
+        max_position_embeddings = rs.override_max_position_embeddings or rs.max_position_embeddings
+        assert max_position_embeddings is not None, \
+            "YaRN scaling requires explicit max_position_embeddings"
+        base = rs.rope_theta
+        dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
+        original_max_position_embeddings = rs.rope_scaling.get("original_max_position_embeddings")
+        has_original_max_position_embeddings = original_max_position_embeddings is not None
+        if not has_original_max_position_embeddings:
+            original_max_position_embeddings = max_position_embeddings
+
+        try:
+            original_max_position_embeddings_int = int(original_max_position_embeddings)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                "YaRN original_max_position_embeddings must be an integer, "
+                f"got {original_max_position_embeddings!r}"
+            ) from None
+        if original_max_position_embeddings != original_max_position_embeddings_int:
+            raise ValueError(
+                "YaRN original_max_position_embeddings must be an integer, "
+                f"got {original_max_position_embeddings!r}"
+            )
+        original_max_position_embeddings = original_max_position_embeddings_int
+
+        if has_original_max_position_embeddings:
+            factor = max_position_embeddings / original_max_position_embeddings
+        else:
+            factor = rs.rope_scaling.get("factor")
+
+        attn_factor = rs.rope_scaling.get("attention_factor")
+        if attn_factor is None:
+            def get_mscale(scale, mscale = 1.0):
+                if scale <= 1:
+                    return 1.0
+                return 0.1 * mscale * math.log(scale) + 1.0
+            mscale = rs.rope_scaling.get("mscale")
+            mscale_all_dim = rs.rope_scaling.get("mscale_all_dim")
+            if rs.yarn_mscale_ratio and mscale and mscale_all_dim:
+                # DeepSeek-family semantics, opted into by the architecture: sin/cos get the
+                # mscale/mscale_all_dim ratio while the arch folds mscale_all_dim into sm_scale.
+                # Only meaningful together with that sm_scale adjustment, so it cannot be inferred
+                # from the presence of the config keys alone: Mistral yarn configs carry
+                # mscale = mscale_all_dim = 1.0 as inert defaults, and taking the ratio there
+                # (as HF transformers does) silently drops the YaRN attention factor
+                attn_factor = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+            elif rs.rope_scaling.get("llama_4_scaling_beta"):
+                # Position-dependent attention scaling supersedes the static YaRN factor
+                # (Ministral-3: ppl 6.81 with 1.0 vs 7.38 with the paper formula)
+                attn_factor = 1.0
+            else:
+                attn_factor = get_mscale(factor)
+        self.llama_4_scaling_beta = rs.rope_scaling.get("llama_4_scaling_beta", 0.0)
+        self.llama_4_scaling_original = original_max_position_embeddings
+        self.inv_freq = yarn_inv_freq(
+            dim, base, self.device,
+            rope_scaling = rs.rope_scaling,
+            factor = factor,
+            original_max_position_embeddings = original_max_position_embeddings,
+        )
+        self.attn_factor = attn_factor
+
+
+    def _rope_params_longrope(self):
+        rs = self.rope_settings
+        base = rs.rope_theta
+        dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
+        a = rs.max_position_embeddings
+        a_override = rs.override_max_position_embeddings or a
+        b = rs.rope_scaling.get("original_max_position_embeddings", rs.original_max_position_embeddings)
+        if a_override > b:
+            factors = rs.rope_scaling.get("long_factor")
+            ext_factors = torch.tensor(factors, dtype = torch.float32, device = self.device)
+        else:
+            factors = rs.rope_scaling.get("short_factor")
+            ext_factors = torch.tensor(factors, dtype = torch.float32, device = self.device)
+        if a > b:
+            scaling = math.sqrt(1 + math.log(a / b) / math.log(b))
+        else:
+            scaling = 1.0
+        inv_freq = 1.0 / (ext_factors * base ** (torch.arange(0, dim, 2, device = self.device).float() / dim))
+        self.inv_freq, self.attn_factor = inv_freq, scaling
+
+
+    def compute_sincos(self, position_ids: torch.Tensor):
+        rs = self.rope_settings
+        freqs = torch.einsum("i,j->ij", position_ids.float(), self.inv_freq)
+        sin = freqs.sin()
+        cos = freqs.cos()
+        if self.attn_factor != 1.0:
+            sin *= self.attn_factor
+            cos *= self.attn_factor
+        match rs.rope_style:
+            case RopeStyle.NEOX:
+                sin = torch.cat((sin, sin), dim = -1)
+                cos = torch.cat((cos, cos), dim = -1)
+            case RopeStyle.GPTJ:
+                sin = torch.repeat_interleave(sin, 2, dim = -1)
+                cos = torch.repeat_interleave(cos, 2, dim = -1)
+        return sin, cos
+
+
+    def expand_cache(self, pos_id_end: int):
+        interval = 2048
+        if pos_id_end >= self.cached_sincos_max:
+            pmax = self.cached_sincos_max
+            nmax = (pos_id_end // interval + 1) * interval
+            nsin, ncos = self.compute_sincos(torch.arange(pmax, nmax, device = self.device))
+            self.cached_sin = torch.cat((self.cached_sin, nsin), dim = 0) if pmax > 0 else nsin
+            self.cached_cos = torch.cat((self.cached_cos, ncos), dim = 0) if pmax > 0 else ncos
+            self.cached_sincos_max = nmax
+
+
+    def apply_torch(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        pos: int = 0,
+        positions: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        in_place = False,
+    ):
+        # TODO: partial rotary factor
+        if in_place:
+            q_ = q
+            k_ = k
+
+        q = q.float()
+        k = k.float()
+
+        if len(q.shape) == 3:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0) if k is not None else k
+            squeeze = True
+        else:
+            squeeze = False
+        bsz, qlen, numheads_q, dim = q.shape
+
+        if positions is not None:
+            position_ids = torch.arange(qlen, device = self.device).unsqueeze(0).repeat(bsz, 1)
+            position_ids += positions.unsqueeze(1)
+
+        if position_ids is not None:
+            if len(position_ids.shape) == 1:
+                position_ids = position_ids.unsqueeze(0)
+            else:
+                assert position_ids.shape[0] == bsz
+            self.expand_cache(position_ids.max().item())
+            sin = self.cached_sin[position_ids]
+            cos = self.cached_cos[position_ids]
+
+        else:
+            self.expand_cache(pos + qlen)
+            sin = self.cached_sin[pos : pos + qlen].unsqueeze(0)
+            cos = self.cached_cos[pos : pos + qlen].unsqueeze(0)
+
+        if k is not None:
+            if self.rope_settings.rope_style == RopeStyle.NEOX:
+                q, k = _apply_rope_embed_qk_neox(q, k, sin, cos)
+            else:
+                q, k = _apply_rope_embed_qk_gptj(q, k, sin, cos)
+        else:
+            if self.rope_settings.rope_style == RopeStyle.NEOX:
+                q = _apply_rope_embed_q_neox(q, sin, cos)
+            else:
+                q = _apply_rope_embed_q_gptj(q, sin, cos)
+
+        if squeeze:
+            q = q.squeeze(0)
+            k = k.squeeze(0) if k is not None else k
+
+        q = q.half()
+        k = k.half()
+
+        if in_place:
+            q_.copy_(q)
+            k_.copy_(k)
+            return q_, k_
+        else:
+            return q, k
+
+
+    def get_mrope_freqs(
+        self,
+        input_ids: torch.Tensor,
+        embeddings: list,  #[MMEmbedding],
+        max_length: int,
+    ):
+        # Create 3D position IDs
+        ids = input_ids.squeeze(0).contiguous()
+        mrope_pos_ids = torch.zeros((3, max_length), dtype = torch.long).contiguous()
+        spans = []
+        grids = []
+        merge_size = None
+        for embedding in embeddings:
+            spans.append((embedding.first_index, embedding.last_index))
+            grids.append(embedding.grid_thw)
+            if merge_size:
+                assert merge_size == embedding.mrope_merge_size, "mrope_merge_size varies across MMEmbeddings"
+            else:
+                merge_size = embedding.mrope_merge_size
+        if merge_size is None: merge_size = 1
+        next_pos_idx = ext.gen_mrope_pos_ids(mrope_pos_ids, ids, merge_size, spans, grids)
+
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, 1, -1, 1)
+        position_ids_expanded = mrope_pos_ids[:, None, None, :].float()
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+        freqs_t = freqs[0]
+        if self.mrope_interleaved:
+            # Qwen3-VL style (apply_interleaved_mrope): frequency index i takes component i % 3 within the
+            # first 3 * section[dim] frequencies of each spatial component, T everywhere else
+            for dim, offset in enumerate((1, 2), start = 1):  # H, W
+                length = self.mrope_section[dim] * 3
+                idx = slice(offset, length, 3)
+                freqs_t[..., idx] = freqs[dim, ..., idx]
+        else:
+            # Qwen2.5-VL / GLM-4V style (freq.split(mrope_section)): contiguous runs of section[0] T,
+            # section[1] H and section[2] W frequencies, highest to lowest
+            start = self.mrope_section[0]
+            for dim in (1, 2):  # H, W
+                end = start + self.mrope_section[dim]
+                freqs_t[..., start:end] = freqs[dim, ..., start:end]
+                start = end
+
+        return freqs_t.contiguous(), next_pos_idx
+
+
+    def apply(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None = None,
+        position: int = 0,
+        positions: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        in_place = False,
+        q_norm: torch.Tensor | None = None,
+        k_norm: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        norm_constant_bias: float = 0.0,
+        inv_freq: torch.Tensor | None = None,
+    ):
+        q = q.contiguous()
+        if k is not None: k = k.contiguous()
+        if positions is not None: positions = positions.contiguous()
+        if position_ids is not None: position_ids = position_ids.contiguous()
+
+        if len(q.shape) == 3:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+
+        if not in_place:
+            out_q = torch.empty_like(q)
+            out_k = torch.empty_like(k) if k is not None else None
+        else:
+            out_q = q
+            out_k = k
+
+        ext.rope(
+            q, out_q,
+            k, out_k,
+            self.inv_freq if inv_freq is None else inv_freq,
+            position,
+            positions,
+            position_ids,
+            self.rope_settings.rope_style,
+            self.attn_factor,
+            q_norm,
+            k_norm,
+            norm_eps,
+            norm_constant_bias,
+            self.llama_4_scaling_beta,
+            self.llama_4_scaling_original,
+            self.rope_settings.rotate_dims,
+            0,
+        )
+            
+        if squeeze:
+            out_q = out_q.squeeze(0)
+            out_k = out_k.squeeze(0) if out_k is not None else None
+
+        return out_q, out_k

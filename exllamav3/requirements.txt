@@ -1,0 +1,12 @@
+torch>=2.6.0
+tokenizers>=0.21.1
+numpy>=2.1.0
+rich
+typing_extensions
+safetensors>=0.3.2
+ninja
+pillow
+pyyaml
+marisa_trie
+pydantic
+llguidance>=1.7.0

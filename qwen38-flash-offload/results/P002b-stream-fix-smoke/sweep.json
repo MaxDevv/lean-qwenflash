@@ -1,0 +1,235 @@
+{
+ "card": "glm53-2x3090",
+ "config": "P002 image ghcr.io/0xsero/glm53-flash-offload@sha256:bb633b0bcb85573ad40b6c408af5e1036ae062c593e42479f4e4d2ab521e551d mode fast (README command)",
+ "started": "2026-10-01T17:39:45+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {},
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 700.2,
+   "min": 688.6,
+   "max": 702.3,
+   "n": 3,
+   "all": [
+    688.6,
+    700.2,
+    702.3
+   ]
+  },
+  "32768": {
+   "median": 958.0,
+   "min": 951.2,
+   "max": 958.9,
+   "n": 3,
+   "all": [
+    951.2,
+    958.0,
+    958.9
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 28.875,
+    "min": 28.17,
+    "max": 29.58,
+    "n": 2,
+    "all": [
+     29.58,
+     28.17
+    ]
+   },
+   "per_stream_mean": {
+    "median": 28.854999999999997,
+    "min": 28.15,
+    "max": 29.56,
+    "n": 2,
+    "all": [
+     29.56,
+     28.15
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 29.58,
+     "per_stream_mean": 29.56,
+     "per_stream_min": 29.56,
+     "tokens": 1548,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.63
+    },
+    {
+     "aggregate": 28.17,
+     "per_stream_mean": 28.15,
+     "per_stream_min": 28.15,
+     "tokens": 1717,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.51
+    }
+   ]
+  },
+  "C2": {
+   "aggregate": {
+    "median": 31.27,
+    "min": 31.0,
+    "max": 31.54,
+    "n": 2,
+    "all": [
+     31.54,
+     31.0
+    ]
+   },
+   "per_stream_mean": {
+    "median": 16.669999999999998,
+    "min": 15.62,
+    "max": 17.72,
+    "n": 2,
+    "all": [
+     17.72,
+     15.62
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 31.54,
+     "per_stream_mean": 17.72,
+     "per_stream_min": 16.25,
+     "tokens": 2889,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 3.53
+    },
+    {
+     "aggregate": 31.0,
+     "per_stream_mean": 15.62,
+     "per_stream_min": 15.5,
+     "tokens": 3618,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 3.07
+    }
+   ]
+  },
+  "C4": {
+   "aggregate": {
+    "median": 35.004999999999995,
+    "min": 34.61,
+    "max": 35.4,
+    "n": 2,
+    "all": [
+     35.4,
+     34.61
+    ]
+   },
+   "per_stream_mean": {
+    "median": 9.95,
+    "min": 9.78,
+    "max": 10.12,
+    "n": 2,
+    "all": [
+     9.78,
+     10.12
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 35.4,
+     "per_stream_mean": 9.78,
+     "per_stream_min": 8.99,
+     "tokens": 7111,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 6.46
+    },
+    {
+     "aggregate": 34.61,
+     "per_stream_mean": 10.12,
+     "per_stream_min": 9.05,
+     "tokens": 7463,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.87
+    }
+   ]
+  },
+  "C1@32k": {
+   "aggregate": {
+    "median": 27.564999999999998,
+    "min": 26.54,
+    "max": 28.59,
+    "n": 2,
+    "all": [
+     26.54,
+     28.59
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 26.54,
+     "per_stream_mean": 26.53,
+     "per_stream_min": 26.53,
+     "tokens": 3183,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 32.83
+    },
+    {
+     "aggregate": 28.59,
+     "per_stream_mean": 28.57,
+     "per_stream_min": 28.57,
+     "tokens": 1644,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.53
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "gates": {
+  "prefill_8192": {
+   "value": 700.2,
+   "best_known": null,
+   "pass": true
+  },
+  "prefill_32768": {
+   "value": 958.0,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 28.88,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C4": {
+   "value": 35.0,
+   "best_known": null,
+   "pass": true
+  }
+ },
+ "finished": "2026-10-01T17:58:17+0200"
+}

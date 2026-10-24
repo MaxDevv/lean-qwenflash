@@ -1,0 +1,1 @@
+docker run -d --name glm53-2026-10-01-P001-image-smoke-registry --gpus "device=1" --shm-size 16g -p 30400:30000 -e GLM53_MODE=fast -v <models dir>/turboderp-GLM-5.3-Flash-exl3-3.05bpw:/models ghcr.io/0xsero/glm53-flash-offload@sha256:1159044a73d91804c25ffa0851d1668518220c631e2efd4e904b7cc0578a7e39

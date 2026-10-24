@@ -1,0 +1,12 @@
+prefill 8192: 563.5 tok/s
+prefill 8192: 582.3 tok/s
+prefill 8192: 558.2 tok/s
+prefill 32768: 806.9 tok/s
+prefill 32768: 805.5 tok/s
+prefill 32768: 803.1 tok/s
+decode C1: aggregate 8.28 tok/s, per-stream 8.27
+decode C2: aggregate 8.23 tok/s, per-stream 8.23
+decode C4: aggregate 8.28 tok/s, per-stream 8.28
+decode C1@32k: 7.74 tok/s
+SWEEP DONE runs/N116-glm53-nvme/s2/s2a_55g/sweep.json
+sweep exit 0

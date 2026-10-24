@@ -1,0 +1,235 @@
+{
+ "card": "glm53-2x3090",
+ "config": "G066a-1g-stage2.6 | -cs 131072 --max-batch-size 8 -chunk_size 8192  | GLM53_ZC_VRAM=0 GLM53_ZC_STATS=/w/glm53/data/stats_own_dec.json GLM53_EC=1 GLM53_EC_WARM=/w/glm53/data/stats_own_dec.json GLM53_EC_RESERVE_GB=1.0 GLM53_EC_STAGE_GB=2.6 GLM53_EC_TIMING=1 GLM53_EC_ELASTIC_GB=10",
+ "started": "2026-10-01T04:23:40+0200",
+ "ctx_len": 131072,
+ "protocol": "bench/sweep.py v1",
+ "template": "glm",
+ "tol": 0.05,
+ "best_known_before": {},
+ "server_args": {
+  "max_running_requests": 8,
+  "max_total_num_tokens": 131072,
+  "chunked_prefill_size": 8192,
+  "kv_cache_dtype": "fp16",
+  "context_length": 131072,
+  "mem_fraction_static": null,
+  "max_mamba_cache_size": null
+ },
+ "prefill": {
+  "8192": {
+   "median": 696.7,
+   "min": 693.9,
+   "max": 697.8,
+   "n": 3,
+   "all": [
+    693.9,
+    697.8,
+    696.7
+   ]
+  },
+  "32768": {
+   "median": 945.2,
+   "min": 944.2,
+   "max": 947.9,
+   "n": 3,
+   "all": [
+    947.9,
+    945.2,
+    944.2
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 12.575,
+    "min": 12.06,
+    "max": 13.09,
+    "n": 2,
+    "all": [
+     13.09,
+     12.06
+    ]
+   },
+   "per_stream_mean": {
+    "median": 12.565000000000001,
+    "min": 12.05,
+    "max": 13.08,
+    "n": 2,
+    "all": [
+     13.08,
+     12.05
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 13.09,
+     "per_stream_mean": 13.08,
+     "per_stream_min": 13.08,
+     "tokens": 1519,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.62
+    },
+    {
+     "aggregate": 12.06,
+     "per_stream_mean": 12.05,
+     "per_stream_min": 12.05,
+     "tokens": 1456,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.58
+    }
+   ]
+  },
+  "C2": {
+   "aggregate": {
+    "median": 12.615,
+    "min": 12.33,
+    "max": 12.9,
+    "n": 2,
+    "all": [
+     12.9,
+     12.33
+    ]
+   },
+   "per_stream_mean": {
+    "median": 9.585,
+    "min": 9.47,
+    "max": 9.7,
+    "n": 2,
+    "all": [
+     9.7,
+     9.47
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 12.9,
+     "per_stream_mean": 9.7,
+     "per_stream_min": 6.53,
+     "tokens": 3000,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 119.18
+    },
+    {
+     "aggregate": 12.33,
+     "per_stream_mean": 9.47,
+     "per_stream_min": 6.15,
+     "tokens": 3006,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 124.19
+    }
+   ]
+  },
+  "C4": {
+   "aggregate": {
+    "median": 12.64,
+    "min": 12.54,
+    "max": 12.74,
+    "n": 2,
+    "all": [
+     12.74,
+     12.54
+    ]
+   },
+   "per_stream_mean": {
+    "median": 8.215,
+    "min": 7.92,
+    "max": 8.51,
+    "n": 2,
+    "all": [
+     8.51,
+     7.92
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 12.74,
+     "per_stream_mean": 8.51,
+     "per_stream_min": 6.37,
+     "tokens": 7953,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 510.71
+    },
+    {
+     "aggregate": 12.54,
+     "per_stream_mean": 7.92,
+     "per_stream_min": 6.14,
+     "tokens": 7553,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 409.18
+    }
+   ]
+  },
+  "C1@32k": {
+   "aggregate": {
+    "median": 11.855,
+    "min": 11.24,
+    "max": 12.47,
+    "n": 2,
+    "all": [
+     11.24,
+     12.47
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 11.24,
+     "per_stream_mean": 11.24,
+     "per_stream_min": 11.24,
+     "tokens": 2261,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 32.72
+    },
+    {
+     "aggregate": 12.47,
+     "per_stream_mean": 12.46,
+     "per_stream_min": 12.46,
+     "tokens": 1934,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 1.62
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "gates": {
+  "prefill_8192": {
+   "value": 696.7,
+   "best_known": null,
+   "pass": true
+  },
+  "prefill_32768": {
+   "value": 945.2,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C1": {
+   "value": 12.57,
+   "best_known": null,
+   "pass": true
+  },
+  "decode_C4": {
+   "value": 12.64,
+   "best_known": null,
+   "pass": true
+  }
+ },
+ "finished": "2026-10-01T05:05:06+0200"
+}

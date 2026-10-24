@@ -1,0 +1,74 @@
+GPU 0: NVIDIA GeForce RTX 3090 (UUID: GPU-936598ed-bbc0-3c75-3929-eae1a2196657)
+[glm53] mode nvme3: host 38 CPUs visible, MemAvailable 465 GiB, GPU 24576 MiB, CPU tier 0
+[glm53] glm53/serve.py -m /models -cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4 --host 0.0.0.0 --port 30316 --served-name glm-5.3-flash 
+/opt/glm53/glm53/serve.py:195: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+ -- nv_tier [    0.1s] installed: store /nvx/glm53_flash_exl3_3.05bpw_experts.bin, 42 routed layers, loader skips expert trellis bytes | memcg cur 0.35 peak 0.35 anon 0.33 file 0.00 GiB, host avail 464.9
+ -- expert_cache installed
+ -- triton_pin: pinned ['chunk_gated_delta_rule_fwd_kernel_h_blockdim64', 'chunk_gla_fwd_kernel_o', 'chunk_kda_fwd_kernel_inter_solve_fused', 'chunk_kda_fwd_kernel_intra_token_parallel', 'chunk_local_cumsum_vector_kernel', 'l2norm_fwd_kernel', 'recompute_w_u_fwd_kda_kernel'] from /opt/glm53/data/triton_pin_exact.json
+ -- Loading /models
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+ -- nv_tier [   57.9s] model loaded + VRAM pool built; DONTNEED on 16 checkpoint files | memcg cur 3.25 peak 10.53 anon 3.15 file 0.06 GiB, host avail 462.2
+ -- nv_tier [   58.2s] CPU tier scale copies: 0.42 GiB | memcg cur 3.55 peak 10.53 anon 3.46 file 0.06 GiB, host avail 462.0
+ -- nv_tier [   58.2s] nv2: rcs reserve 4.0 GiB, margin 3.0 GiB, prefill ring 192 slots (1.69 GiB) -> RAM tier 4831 slots (42.46 GiB) | memcg cur 3.55 peak 10.53 anon 3.46 file 0.06 GiB, host avail 462.0
+ -- nv_tier [   61.2s] nv2: RAM arena + prefill ring registered | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 417.3
+ -- nv_tier [   61.2s] nv2 engine up: 42 layers x 288, readers 16 on [26, 27, 28].., exclusive True, CPU tier True | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 417.3
+ -- nv_tier [   62.9s] nv2 RAM warm: 4831 experts in 1.7 s | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 417.3
+ -- nv_tier [   63.9s] nv2 post-warm: 1302 VRAM-resident, 1302 RAM copies of them dropped (exclusive), RAM resident 4831, free 0 | memcg cur 47.78 peak 47.78 anon 47.60 file 0.06 GiB, host avail 417.3
+ -- nv_tier [   64.6s] nv2 CPU tier: 22 threads on 2-23, mode -1, swiglu clamp 10.0, selftest {'EXACT': 0.000999, 'AFFINE': 0.001067, 'I16': 0.001071} | memcg cur 47.81 peak 48.06 anon 47.62 file 0.06 GiB, host avail 417.3
+ -- expert_cache: cuda:0: 42 MoE layers (experts 0..287), 1312 slots x 9.44 MB = 12.38 GB (31.2/layer), admit <= 64 picks, stage 2 x 295 experts (>= 512 picks), warm /opt/glm53/data/stats_own_dec.json
+ -- nv_tier [   64.6s] nv2 ready: 36288 expert linears on the bounce slot, 114.2 GB of checkpoint expert bytes never read, DONTNEED on 16 files | memcg cur 47.81 peak 48.06 anon 47.62 file 0.06 GiB, host avail 417.3
+ -- nv2 startup verify: {'vram_checked': 32, 'vram_bad': 0, 'ram_checked': 32, 'ram_bad': 0, 'table_bad': 0, 'rows_stale_nonvram': 0, 'home_bad_resident': 0, 'home_bad_nonresident': 0, 'ram_resident': 4831, 'vram_and_ram': 0, 'pinned': 0, 'dev_bad_rows': 0}
+ -- k_hcfuse (K101): 45/45 blocks fused for R <= 8
+ -- loaded in 64.2 s
+[transformers] You are using a model of type `glm5_next` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+ -- main thread on cpus [24]
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 2 ms of 7740 ms (max 2 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3612 ms of 4290 ms (max 97 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 29 ms of 8050 ms (max 29 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 30 ms of 7867 ms (max 30 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 30 ms of 7880 ms (max 30 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 6 ms of 7811 ms (max 6 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3635 ms of 4302 ms (max 97 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 31 ms of 7624 ms (max 31 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3603 ms of 4316 ms (max 96 ms/layer)
+ -- nv2 prefill forward: 42 layers, GPU stalled on staging 3522 ms of 4444 ms (max 92 ms/layer)
+ -- nv2 prefill forward: 42 layers, GPU stalled on staging 3319 ms of 4470 ms (max 102 ms/layer)
+ -- nv2 prefill forward: 42 layers, GPU stalled on staging 3563 ms of 4378 ms (max 97 ms/layer)
+ -- nv2 prefill forward: 42 layers, GPU stalled on staging 3519 ms of 4428 ms (max 103 ms/layer)
+ -- nv2 prefill forward: 42 layers, GPU stalled on staging 3429 ms of 4384 ms (max 103 ms/layer)
+ -- nv2 prefill forward: 42 layers, GPU stalled on staging 3410 ms of 4353 ms (max 94 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3446 ms of 4133 ms (max 94 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3529 ms of 4242 ms (max 92 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 49 ms of 7705 ms (max 49 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3492 ms of 4385 ms (max 95 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 45 ms of 7697 ms (max 45 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3472 ms of 4324 ms (max 96 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 42 ms of 7636 ms (max 42 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3489 ms of 4295 ms (max 94 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 44 ms of 7883 ms (max 44 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 44 ms of 7977 ms (max 44 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 44 ms of 8162 ms (max 44 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 45 ms of 7920 ms (max 45 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3583 ms of 4371 ms (max 95 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 46 ms of 7952 ms (max 45 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 4 ms of 7895 ms (max 4 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 46 ms of 8082 ms (max 46 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 46 ms of 7726 ms (max 46 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3522 ms of 4339 ms (max 95 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 45 ms of 7937 ms (max 45 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 45 ms of 7900 ms (max 45 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 24 ms of 7892 ms (max 24 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 45 ms of 7783 ms (max 45 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 3579 ms of 4329 ms (max 96 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 67 ms of 8319 ms (max 61 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 68 ms of 7945 ms (max 61 ms/layer)
+ -- nv2 prefill forward: 41 layers, GPU stalled on staging 69 ms of 8188 ms (max 61 ms/layer)

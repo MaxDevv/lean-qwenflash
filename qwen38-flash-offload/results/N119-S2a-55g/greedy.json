@@ -1,0 +1,57 @@
+{
+ "results": [
+  {
+   "prompt": "Explain how a hash map handles collisions, with a short example in Python.",
+   "thinking": false,
+   "content": "# Hash Map Collision Handling\n\nWhen two different keys hash to the same bucket index, a **collision** occurs. Hash maps handle this in two main ways:\n\n## 1. Chaining (Separate Chaining)\n\nEach bucket stores a list (or linked list) of all key-value pairs that hash to it. On lookup, the map hashes the key, finds the bucket, then searches the list for the exact key.\n\n## 2. Open Addressing\n\nIf a bucket is occupied, the map probes for the next available slot (linear probing, quadratic probing, or double hashing). Python's built-in `dict` uses a variant of this called **open addressing with perturbation**.\n\n---\n\n## Python Example: Chaining\n\n```python\nclass HashMap:\n    def __init__(self, capacity=8):\n        self.capacity = capacity\n        self.buckets = [[] for _ in range(capacity)]\n\n    def _hash(self, key):\n        return hash(key) % self.capacity\n\n    def put(self, key, value):\n        index = self._hash(key)\n        bucket = self.buckets[index]\n        # Update value if key already exists\n        for i, (k, v) in enumerate(bucket):\n            if k == key:\n                bucket[i] = (key, value)\n                return\n        # Otherwise, append (this is where collisions live!)\n        bucket.append((key, value))\n\n    def get(self, key):\n        index = self._hash(key)\n        for k, v in self.buckets[index]:\n            if k == key:\n                return v\n        raise KeyError(key)\n\n\n# Demo: force a collision\nm = HashMap(capacity=1)   # tiny capacity \u2192 every key collides\nm.put(\"apple\", 1)\nm.put(\"banana\", 2)\nm.put(\"cherry\", 3)\n\nprint(m.get(\"apple\"))    # 1\nprint(m.get(\"banana\"))   # 2\nprint(m.get(\"cherry\"))   # 3\n```\n\n**What's happening:** With `capacity=1`, all three keys hash to bucket `0`. Instead of overwriting each other, they coexist as a list of tuples: `[(\"apple\", 1), (\"banana\", 2), (\"cherry\", 3)]`. The `get` method scans that list and matches on the *actual key*, not just the hash.\n\n---\n\n## Key Takeaways\n\n- **Chaining** is simple and handles collisions gracefully, but lookups degrade to O(n) within a bucket if many keys collide.\n- **Good hash functions + resizing** (rehashing all entries into a larger table when load factor exceeds ~0.75) keep buckets short, preserving average O(1) performance.\n- **Open addressing** avoids pointer overhead but requires deletion tombstones and careful probe sequences.",
+   "reasoning": null,
+   "completion_tokens": 584,
+   "finish": "stop",
+   "seconds": 83.2
+  },
+  {
+   "prompt": "What causes the seasons on Earth? Answer in one paragraph.",
+   "thinking": false,
+   "content": "The seasons are caused by Earth's axial tilt of about 23.5 degrees, not by distance from the Sun. As Earth orbits the Sun over the course of a year, this tilt remains fixed in direction (pointing toward Polaris), so each hemisphere alternately leans toward or away from the Sun. When your hemisphere tilts toward the Sun, sunlight strikes it more directly (at a steeper angle), concentrating energy over a smaller area and producing longer days and shorter nights\u2014this is summer. When your hemisphere tilts away, sunlight arrives at a shallow angle, spreading the same energy over a larger area, and days are short\u2014this is winter. The common misconception that seasons result from Earth's distance from the Sun is disproven by the fact that Earth is actually closest to the Sun (perihelion) in early January, during the Northern Hemisphere's winter.",
+   "reasoning": null,
+   "completion_tokens": 178,
+   "finish": "stop",
+   "seconds": 23.8
+  },
+  {
+   "prompt": "Write a bash one-liner that counts lines in all .py files recursively, and explain it.",
+   "thinking": false,
+   "content": "# Counting Lines in All .py Files Recursively\n\n## The One-Liner\n\n```bash\nfind . -name \"*.py\" -type f -exec wc -l {} + | tail -n 1\n```\n\n## How It Works\n\nLet's break down each part:\n\n### `find . -name \"*.py\" -type f`\n- **`find .`** \u2014 searches starting from the current directory, descending into all subdirectories\n- **`-name \"*.py\"`** \u2014 matches files ending in `.py`\n- **`-type f`** \u2014 restricts results to regular files (skips directories that happen to be named `something.py`)\n\n### `-exec wc -l {} +`\n- **`wc -l`** \u2014 the \"word count\" tool with the `-l` flag, which counts lines\n- **`{}`** \u2014 a placeholder where `find` inserts each matched filename\n- **`+`** \u2014 batches all filenames into as few `wc` invocations as possible (unlike `\\;`, which runs `wc` once per file)\n\n### `| tail -n 1`\n- When `wc` receives multiple files, it prints a per-file count **plus a `total` line** at the end\n- **`tail -n 1`** grabs just that final total line, so you get one clean summary instead of a wall of output\n\n## Example Output\n\n```\n    1234 total\n```\n\n## Alternative: Skip the Tail\n\nIf you want per-file breakdowns *and* the total, drop the pipe:\n\n```bash\nfind . -name \"*.py\" -type f -exec wc -l {} +\n```\n\n```\n  120 ./main.py\n  340 ./utils/helpers.py\n  774 ./tests/test_main.py\n  1234 total\n```\n\n## Bonus: A Pure-Bash Alternative\n\n```bash\nwc -l --include=\"*.py\" -r .\n```\n\nThis uses `grep`-style recursion via `wc`'s `-r` flag (GNU coreutils only), though the `find` version is more portable and widely compatible.",
+   "reasoning": null,
+   "completion_tokens": 452,
+   "finish": "stop",
+   "seconds": 62.9
+  },
+  {
+   "prompt": "Summarize the plot of Hamlet in five sentences.",
+   "thinking": false,
+   "content": "# Hamlet: Plot Summary\n\nPrince Hamlet of Denmark is devastated when his father dies and his mother, Gertrude, quickly marries his uncle Claudius, who has taken the throne. The ghost of Hamlet's father appears and reveals that Claudius murdered him, demanding that Hamlet avenge his death. Hamlet feigns madness while he struggles with doubt and delays taking action, staging a play that mirrors the murder to test Claudius's guilt\u2014Claudius's panicked reaction confirms the crime. In a series of tragic missteps, Hamlet kills Polonius by mistake, prompting Ophelia's madness and death, and earning the wrath of her brother Laertes. In the final scene, Claudius's plot to kill Hamlet with a poisoned blade and drink backfires, leaving Gertrude, Claudius, Laertes, and Hamlet himself all dead, with the Norwegian prince Fortinbras arriving to claim the throne.",
+   "reasoning": null,
+   "completion_tokens": 197,
+   "finish": "stop",
+   "seconds": 24.0
+  },
+  {
+   "prompt": "What is 17 * 23? Think it through.",
+   "thinking": true,
+   "content": "# Calculating 17 \u00d7 23\n\n**Method: Break it into easier parts**\n\nI'll split 23 into 20 + 3:\n\n$$17 \\times 23 = 17 \\times 20 + 17 \\times 3$$\n\n**Step 1:** 17 \u00d7 20 = 340\n\n**Step 2:** 17 \u00d7 3 = 51\n\n**Step 3:** Add them together:\n$$340 + 51 = 391$$\n\n**Verification** (using a neat trick): 17 and 23 are both 3 away from 20, so this is a difference of squares:\n$$(20 - 3)(20 + 3) = 20^2 - 3^2 = 400 - 9 = 391 \u2713$$\n\n## Answer: **391**",
+   "reasoning": "The user wants me to calculate 17 \u00d7 23 and think it through.\n\nLet me work through this carefully.\n\nMethod 1: Break it down\n17 \u00d7 23 = 17 \u00d7 20 + 17 \u00d7 3\n17 \u00d7 20 = 340\n17 \u00d7 3 = 51\n340 + 51 = 391\n\nMethod 2: Alternative breakdown\n23 \u00d7 17 = 23 \u00d7 10 + 23 \u00d7 7\n23 \u00d7 10 = 230\n23 \u00d7 7 = 161\n230 + 161 = 391\n\nMethod 3: Using difference of squares\n17 \u00d7 23 = (20 - 3)(20 + 3) = 20\u00b2 - 3\u00b2 = 400 - 9 = 391\n\nAll methods agree: 391.\n\nLet me verify once more with standard multiplication:\n  17\n\u00d7 23\n-----\n  51  (17 \u00d7 3)\n 340  (17 \u00d7 20)\n-----\n 391\n\nYes, 391 is correct.",
+   "completion_tokens": 399,
+   "finish": "stop",
+   "seconds": 54.4
+  }
+ ],
+ "equal": [
+  true,
+  true,
+  true,
+  true,
+  true
+ ],
+ "all_equal": true
+}

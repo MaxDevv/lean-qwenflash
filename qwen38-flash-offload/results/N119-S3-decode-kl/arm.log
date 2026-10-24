@@ -1,0 +1,8 @@
+[07:41:29] decode-kl start nvme3 GLM53_K_OVL=0 GLM53_NV_VRING=24 GLM53_NV_PREFETCH=1 GLM53_EC_RESERVE_GB=1.0
+[07:50:56] decode-kl exit 0
+VARIANT control_off {"positions": 1088, "kl_mean": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "top1_agree": 1.0, "forced_mismatch": [null, null, null, null, null, null], "cpu_experts_per_layer_call": 0.0}
+VARIANT cpu_default {"positions": 1088, "kl_mean": 0.004677131945043902, "kl_p99": 0.08179178833961487, "kl_max": 0.25877320766448975, "top1_agree": 0.9862132352941176, "forced_mismatch": [null, null, null, null, null, null], "cpu_experts_per_layer_call": 3.5505295868347337}
+VARIANT cpu_noclamp {"positions": 1088, "kl_mean": 0.006347528704208453, "kl_p99": 0.11588531732559204, "kl_max": 0.6156660318374634, "top1_agree": 0.9834558823529411, "forced_mismatch": [null, null, null, null, null, null], "cpu_experts_per_layer_call": 3.5638786764705883}
+DECODE_KL_DONE
+CLEAN
+[07:51:21] ARM_DONE

@@ -1,0 +1,9 @@
+[0] 384 pos  top1 1.0000  KL 0.00000
+[1] 646 pos  top1 1.0000  KL 0.00000
+[2] 31 pos  top1 1.0000  KL 0.00000
+[3] 163 pos  top1 1.0000  KL 0.00000
+[4] 246 pos  top1 1.0000  KL 0.00000
+[5] 355 pos  top1 1.0000  KL 0.00000
+[6] 307 pos  top1 1.0000  KL 0.00000
+[7] 22 pos  top1 1.0000  KL 0.00000
+{"positions": 2154, "top1_agreement": 1.0, "mean_kl_top20": 0.0}

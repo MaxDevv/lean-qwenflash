@@ -1,0 +1,8 @@
+[12:11:13] A_image: ready=1 after 76 s
+[12:24:53] A_image: prefill 8192: 507.9 tok/s prefill 8192: 529.0 tok/s prefill 8192: 552.9 tok/s decode C1: aggregate 13.11 tok/s, per-stream 13.11 decode C1@32k: 12.44 tok/s 
+[12:24:55] A_image: stopped
+[12:26:11] B_campaign: ready=1 after 76 s
+[12:40:05] B_campaign: prefill 8192: 499.9 tok/s prefill 8192: 535.8 tok/s prefill 8192: 529.8 tok/s decode C1: aggregate 12.16 tok/s, per-stream 12.16 decode C1@32k: 11.62 tok/s 
+[12:40:06] B_campaign: stopped
+[12:40:49] kcheck after: CLEAN
+[12:40:49] AB_DONE

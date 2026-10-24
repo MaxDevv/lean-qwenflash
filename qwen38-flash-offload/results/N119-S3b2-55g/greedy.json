@@ -1,0 +1,57 @@
+{
+ "results": [
+  {
+   "prompt": "Explain how a hash map handles collisions, with a short example in Python.",
+   "thinking": false,
+   "content": "# Hash Map Collision Handling\n\nWhen two different keys hash to the same bucket index, a **collision** occurs. There are two main strategies for handling this:\n\n## 1. Chaining (Separate Chaining)\n\nEach bucket stores a list (or linked list) of all key-value pairs that hash to it. On lookup, you hash the key, find the bucket, then search within that list for the exact key.\n\n## 2. Open Addressing\n\nIf a bucket is occupied, probe for the next available slot (linear probing, quadratic probing, or double hashing). Python's built-in `dict` uses a variant of this called **open addressing with perturbation**.\n\n---\n\n## Python Example: Chaining\n\n```python\nclass HashMap:\n    def __init__(self, capacity=8):\n        self.capacity = capacity\n        self.buckets = [[] for _ in range(capacity)]\n\n    def _hash(self, key):\n        return hash(key) % self.capacity\n\n    def put(self, key, value):\n        index = self._hash(key)\n        bucket = self.buckets[index]\n        # Update value if key already exists\n        for i, (k, v) in enumerate(bucket):\n            if k == key:\n                bucket[i] = (key, value)\n                return\n        # Otherwise, append (this is where collisions \"chain up\")\n        bucket.append((key, value))\n\n    def get(self, key):\n        index = self._hash(key)\n        for k, v in self.buckets[index]:\n            if k == key:\n                return v\n        raise KeyError(key)\n\n    def remove(self, key):\n        index = self._hash(key)\n        bucket = self.buckets[index]\n        for i, (k, v) in enumerate(bucket):\n            if k == key:\n                del bucket[i]\n                return\n        raise KeyError(key)\n\n\n# --- Demo with forced collisions ---\nh = HashMap(capacity=1)   # capacity of 1 forces every key into the same bucket\n\nh.put(\"apple\", 1)\nh.put(\"banana\", 2)        # collides with \"apple\" \u2014 chained in the same bucket\nh.put(\"cherry\", 3)        # collides again\n\nprint(h.get(\"apple\"))     # 1\nprint(h.get(\"banana\"))    # 2\nprint(h.get(\"cherry\"))    # 3\n\nh.remove(\"banana\")\nprint(h.get(\"cherry\"))    # 3 \u2014 still works despite the earlier collision\n```\n\n**Output:**\n```\n1\n2\n3\n3\n```\n\n## Key Points\n\n- **Why compare keys, not just hashes?** Two different keys can share a bucket, so after finding the bucket, you must check `k == key` to get the right entry.\n- **Performance:** With chaining, lookups are O(1) on average but degrade to O(n) if many keys pile into one bucket. Real implementations **resize** (rehash everything into a larger table) when the *load factor* (entries \u00f7 capacity) exceeds a threshold \u2014 Python's `dict` resizes when it's about two-thirds full.\n- **Trade-offs:** Chaining is simple and tolerates high load factors; open addressing has better cache locality but requires careful deletion handling (tombstones) and stricter load factor limits.",
+   "reasoning": null,
+   "completion_tokens": 691,
+   "finish": "stop",
+   "seconds": 54.4
+  },
+  {
+   "prompt": "What causes the seasons on Earth? Answer in one paragraph.",
+   "thinking": false,
+   "content": "The seasons are caused by Earth's axial tilt of about 23.5 degrees, not by distance from the Sun. As Earth orbits the Sun, this tilt stays pointed in the same direction, so each hemisphere alternately leans toward or away from the Sun throughout the year. When your hemisphere tilts toward the Sun, sunlight strikes it more directly and days are longer, concentrating more solar energy and creating summer; when it tilts away, sunlight arrives at a shallow angle, spreads over a larger area, and days are shorter, producing winter. This also explains why seasons are opposite in the Northern and Southern Hemispheres, and why a common misconception\u2014that Earth is closer to the Sun in summer\u2014doesn't hold up, since Earth is actually closest to the Sun in early January, during the Northern Hemisphere's winter.",
+   "reasoning": null,
+   "completion_tokens": 165,
+   "finish": "stop",
+   "seconds": 12.7
+  },
+  {
+   "prompt": "Write a bash one-liner that counts lines in all .py files recursively, and explain it.",
+   "thinking": false,
+   "content": "# Counting Lines in All `.py` Files Recursively\n\n## The One-Liner\n\n```bash\nfind . -name \"*.py\" -type f -exec wc -l {} + | tail -n 1\n```\n\n## How It Works\n\n**`find .`** \u2014 Starts searching from the current directory, descending into all subdirectories recursively.\n\n**`-name \"*.py\"`** \u2014 Matches only files whose names end in `.py`.\n\n**`-type f`** \u2014 Restricts results to regular files (skips directories, symlinks, etc.).\n\n**`-exec wc -l {} +`** \u2014 Runs `wc -l` (word count, lines only) on the matched files. The `{}` is a placeholder for the filenames, and the trailing `+` batches as many files as possible into a single `wc` invocation \u2014 far more efficient than `\\;`, which would spawn one process per file.\n\n**`| tail -n 1`** \u2014 When `wc` receives multiple files, it prints per-file counts plus a final `total` line. `tail -n 1` extracts just that total.\n\n## Example Output\n\n```\n  15234 total\n```\n\n## Alternative: Cleaner Total with awk\n\nIf you want the total without relying on `wc`'s summary line (and to avoid double-counting if a file is literally named `total`):\n\n```bash\nfind . -name \"*.py\" -type f -exec cat {} + | wc -l\n```\n\nThis concatenates all file contents into one stream and counts lines \u2014 a single, unambiguous total.\n\n## Alternative: Per-File Breakdown\n\nTo see each file's count *and* the total, sorted by size:\n\n```bash\nfind . -name \"*.py\" -type f -exec wc -l {} + | sort -rn\n```\n\n## Gotchas\n\n- **Filenames with spaces/newlines**: `-exec ... +` handles them safely, unlike piping `find` output through `xargs` without `-0`.\n- **Hidden directories** (like `.venv` or `node_modules`-style folders) **are included** by default. To exclude one:\n\n  ```bash\n  find . -path \"./.venv\" -prune -o -name \"*.py\" -type f -exec wc -l {} +\n  ```\n\n- **Symlinked files** are skipped unless you add `-L` to `find`.",
+   "reasoning": null,
+   "completion_tokens": 513,
+   "finish": "stop",
+   "seconds": 40.5
+  },
+  {
+   "prompt": "Summarize the plot of Hamlet in five sentences.",
+   "thinking": false,
+   "content": "# Hamlet: Plot Summary\n\nPrince Hamlet of Denmark is devastated when his father dies and his mother, Gertrude, quickly remarries his uncle Claudius, who has taken the throne. The ghost of Hamlet's father appears and reveals that Claudius murdered him, demanding that Hamlet seek revenge. Hamlet feigns madness while struggling with doubt and delay, staging a play that mirrors the murder to test Claudius's guilt\u2014Claudius's panicked reaction confirms the crime. In a series of tragic missteps, Hamlet kills Polonius by mistake, prompting Ophelia's madness and death, and is sent to England with orders for his execution, though he escapes and returns. In the final scene, a rigged fencing match leads to the deaths of Gertrude (poisoned), Claudius (stabbed and poisoned), Laertes (wounded), and Hamlet himself, leaving the Norwegian prince Fortinbras to claim the throne.",
+   "reasoning": null,
+   "completion_tokens": 198,
+   "finish": "stop",
+   "seconds": 14.5
+  },
+  {
+   "prompt": "What is 17 * 23? Think it through.",
+   "thinking": true,
+   "content": "# Calculating 17 \u00d7 23\n\n**Method: Break it into easier parts**\n\nI'll split 23 into 20 + 3:\n\n$$17 \\times 23 = 17 \\times 20 + 17 \\times 3$$\n\n**Step 1:** 17 \u00d7 20 = 340\n\n**Step 2:** 17 \u00d7 3 = 51\n\n**Step 3:** Add them together:\n$$340 + 51 = 391$$\n\n**Verification with a neat trick:** Since 17 and 23 are both 3 away from 20, I can use the difference of squares:\n$$(20 - 3)(20 + 3) = 20^2 - 3^2 = 400 - 9 = 391 \u2713$$\n\n## Answer: **391**",
+   "reasoning": "The user wants me to calculate 17 \u00d7 23 and think it through.\n\nLet me work through this carefully.\n\n17 \u00d7 23\n\nMethod 1: Break it down\n17 \u00d7 23 = 17 \u00d7 20 + 17 \u00d7 3\n17 \u00d7 20 = 340\n17 \u00d7 3 = 51\n340 + 51 = 391\n\nMethod 2: Alternative breakdown\n23 \u00d7 17 = 23 \u00d7 10 + 23 \u00d7 7\n23 \u00d7 10 = 230\n23 \u00d7 7 = 161\n230 + 161 = 391\n\nMethod 3: Difference of squares trick\n17 \u00d7 23 = (20 - 3)(20 + 3) = 20\u00b2 - 3\u00b2 = 400 - 9 = 391\n\nAll methods agree: 391.\n\nLet me verify once more with another approach:\n17 \u00d7 23 = 17 \u00d7 25 - 17 \u00d7 2 = 425 - 34 = 391 \u2713\n\nThe answer is 391.",
+   "completion_tokens": 398,
+   "finish": "stop",
+   "seconds": 28.9
+  }
+ ],
+ "equal": [
+  false,
+  false,
+  false,
+  false,
+  false
+ ],
+ "all_equal": false
+}

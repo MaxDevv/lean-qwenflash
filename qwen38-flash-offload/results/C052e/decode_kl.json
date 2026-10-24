@@ -1,0 +1,155 @@
+{
+ "positions": 1288,
+ "kl_mean": 0.005336036364159752,
+ "kl_p99": 0.08588913083076477,
+ "top1_agree": 0.9767080745341615,
+ "first_divergence": [
+  0,
+  165,
+  119,
+  135,
+  95,
+  17
+ ],
+ "cpu_tier": {
+  "calls": 191730,
+  "unique_hits": 657247,
+  "unique_misses": 876593,
+  "cpu_experts": 735575,
+  "cpu_experts_per_call": 3.837,
+  "misses_per_call": 4.572,
+  "hit_rate_unique": 0.4285,
+  "gpu_wait_ms_per_job": 0.0861,
+  "gpu_waits": 191386,
+  "timeouts": 0,
+  "host_jobs": 191386,
+  "host_busy_ms_per_job": 0.4901,
+  "host_empty_jobs": 0,
+  "cpu_copy_gb": 114.2,
+  "selftest": {
+   "EXACT": 0.000994,
+   "AFFINE": 0.001045,
+   "I16": 0.00105
+  },
+  "policy": [
+   0.4000000059604645,
+   0.023000000044703484,
+   0.10999999940395355,
+   0.10400000214576721,
+   0.20000000298023224,
+   32.0,
+   -1.0,
+   0.0
+  ]
+ },
+ "per_prompt": [
+  {
+   "prompt": "What is the capital of Australia, and why was it chosen over Sydney and Melbourne?",
+   "tokens": 256,
+   "kl_mean": 0.013661898672580719,
+   "kl_max": 0.18564334511756897,
+   "top1_agree": 0.95703125,
+   "greedy_first_divergence": 0,
+   "disagree_margins_nats": [
+    0.0469,
+    0.2656,
+    0.2344,
+    0.4844,
+    0.1094,
+    0.0156,
+    0.4531,
+    0.7422,
+    0.1719,
+    0.3125,
+    0.6562
+   ],
+   "restarts": 12,
+   "sec_exact": 22.2,
+   "sec_tier": 88.2
+  },
+  {
+   "prompt": "Write a Python function that checks whether a string is a palindrome, ignoring punctuation and case.",
+   "tokens": 256,
+   "kl_mean": 0.0012706519337370992,
+   "kl_max": 0.08453120291233063,
+   "top1_agree": 0.9921875,
+   "greedy_first_divergence": 165,
+   "disagree_margins_nats": [
+    0.0781,
+    0.1406
+   ],
+   "restarts": 3,
+   "sec_exact": 25.1,
+   "sec_tier": 24.4
+  },
+  {
+   "prompt": "What is 17 multiplied by 23? Show the calculation.",
+   "tokens": 128,
+   "kl_mean": 0.0007846209337003529,
+   "kl_max": 0.023176226764917374,
+   "top1_agree": 0.9921875,
+   "greedy_first_divergence": 119,
+   "disagree_margins_nats": [
+    0.0781
+   ],
+   "restarts": 2,
+   "sec_exact": 11.5,
+   "sec_tier": 8.2
+  },
+  {
+   "prompt": "Translate into German: 'The train was late, so we missed the beginning of the concert.'",
+   "tokens": 196,
+   "kl_mean": 0.002589010400697589,
+   "kl_max": 0.09881991147994995,
+   "top1_agree": 0.9846938775510204,
+   "greedy_first_divergence": 135,
+   "disagree_margins_nats": [
+    0.25,
+    0.9219,
+    0.0312
+   ],
+   "restarts": 4,
+   "sec_exact": 16.8,
+   "sec_tier": 22.1
+  },
+  {
+   "prompt": "Summarise the causes of the 2008 financial crisis in five bullet points.",
+   "tokens": 196,
+   "kl_mean": 0.0033722382504493,
+   "kl_max": 0.08151815831661224,
+   "top1_agree": 0.9948979591836735,
+   "greedy_first_divergence": 95,
+   "disagree_margins_nats": [
+    0.2031
+   ],
+   "restarts": 2,
+   "sec_exact": 16.7,
+   "sec_tier": 13.9
+  },
+  {
+   "prompt": "Explain what a hash table is to a 12-year-old.",
+   "tokens": 256,
+   "kl_mean": 0.006957989651709795,
+   "kl_max": 0.16175894439220428,
+   "top1_agree": 0.953125,
+   "greedy_first_divergence": 17,
+   "disagree_margins_nats": [
+    0.125,
+    0.0312,
+    0.3438,
+    1.2656,
+    0.0781,
+    0.4531,
+    0.0781,
+    0.7969,
+    0.125,
+    0.6406,
+    0.2812,
+    0.1875
+   ],
+   "restarts": 13,
+   "sec_exact": 23.0,
+   "sec_tier": 105.0
+  }
+ ]
+}

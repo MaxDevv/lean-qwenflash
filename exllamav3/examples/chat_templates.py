@@ -1,0 +1,1253 @@
+
+class PromptFormat:
+    def __init__(self, user_name, bot_name):
+        self.user_name = user_name
+        self.bot_name = bot_name
+    def set_special(self, spc: dict):
+        pass
+    def default_system_prompt(self, think):
+        raise NotImplementedError()
+    def format(self, system_prompt, messages, think):
+        raise NotImplementedError()
+    def add_bos(self):
+        raise NotImplementedError()
+    def thinktag(self):
+        return "<think>", "</think>"
+    def is_harmony_like(self):
+        return False
+    def harmony_tags(self):
+        # None: Streamer_harmony keeps its GPT-OSS default tags
+        return None
+    def inject_thinktag(self):
+        return True
+
+
+class PromptFormat_raw(PromptFormat):
+    description = "Model-agnostic mode simulating a raw chatlog"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"This is a conversation between a helpful AI assistant " +
+            (f"named {self.bot_name} " if self.bot_name != "Assistant" else "") +
+            (f"and a user named {self.user_name}." if self.user_name != "User" else """and a user.""")
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = system_prompt + "\n"
+        for (u, a) in messages:
+            context += f"{self.user_name}: {u}\n"
+            context += f"{self.bot_name}:"
+            if a is not None:
+                context += f"{a}\n"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            self.user_name + ":",
+            self.user_name[0:1] + ":",
+            self.user_name.upper() + ":",
+            self.user_name.lower() + ":",
+            tokenizer.eos_token_id
+        ]
+
+
+class PromptFormat_llama3(PromptFormat):
+    description = "Llama3-instruct models"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            """Assist users with tasks and answer questions to the best of your knowledge. Provide helpful and informative """
+            """responses. Be conversational and engaging. If you are unsure or lack knowledge on a topic, admit it and try """
+            """to find the answer or suggest where to find it. Keep responses concise and relevant. Follow ethical """
+            """guidelines and promote a safe and respectful interaction."""
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+        for (u, a) in messages:
+            context += f"<|start_header_id|>user<|end_header_id|>\n\n{u}<|eot_id|>"
+            context += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            if a is not None: context += f"{a}<|eot_id|>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|eot_id|>"),
+            tokenizer.single_id("<|start_header_id|>")
+        ]
+
+
+class PromptFormat_chatml(PromptFormat):
+    description = "ChatML format, as used by e.g. Qwen"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>\n"
+            context += f"<|im_start|>assistant\n"
+            if a is not None: context += f"{a}<|im_end|>\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+
+class PromptFormat_mimo(PromptFormat):
+    description = "MiMo (ChatML variant)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        # MiMo quirk: no newline after <|im_end|>
+        context = ""
+        if system_prompt:
+            context += f"<|im_start|>system\n{system_prompt}<|im_end|>"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>"
+            context += f"<|im_start|>assistant\n"
+            if a is None and not think:
+                # Closed think tags to disable thinking
+                context += "<think></think>"
+            if a is not None: context += f"{a}<|im_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        # Also no newline after <think>
+        return "<think>", "</think>"
+
+    def inject_thinktag(self):
+        # Model decides in reasoning mode
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+
+class PromptFormat_qwen35(PromptFormat):
+    description = "Qwen3.5 format, reasoning-aware ChatML"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>\n"
+            context += f"<|im_start|>assistant\n"
+            if a is not None:
+                context += f"{a}<|im_end|>\n"
+            elif not think:
+                context += f"<think>\n\n</think>\n\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+
+class PromptFormat_phi(PromptFormat):
+    description = "Phi3/Phi4 instruct models (note, some Phi4 models use ChatML)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"<|system|>\n{system_prompt}<|end|>\n"
+        for (u, a) in messages:
+            context += f"<|user|>\n{u}<|end|>\n"
+            context += f"<|assistant|>\n"
+            if a is not None: context += f"{a}<|end|>\n"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|end|>"),
+        ]
+
+
+class PromptFormat_glm(PromptFormat):
+    description = "ChatGLM(4) models"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"[gMASK]<sop>"
+        if think:
+            context += "<|system|>Reasoning Effort: High"
+        context += f"<|system|>{system_prompt}"
+        for (u, a) in messages:
+            context += f"<|user|>\n{u}"
+            context += f"<|assistant|>\n"
+            if a is not None: context += f"{a}"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|user|>"),
+            tokenizer.single_id("</answer>"),
+            tokenizer.single_id("<|observation|>"),
+        ]
+
+
+class PromptFormat_mistral(PromptFormat):
+    description = "Mistral-instruct models (v3)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            """You are a helpful AI assistant."""
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        first = True
+        for (u, a) in messages:
+            if first:
+                context += f"[INST] {system_prompt}\n\n{u}[/INST]"
+                first = False
+            else:
+                context += f"[INST] {u}[/INST]"
+            if a is not None: context += f" {a}</s>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id
+        ]
+
+
+class PromptFormat_mistral3(PromptFormat):
+    description = "Mistral3/Ministral-instruct models"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            """You are a helpful AI assistant."""
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
+        context += \
+            """[MODEL_SETTINGS]{"reasoning_effort": "{high}"}[/MODEL_SETTINGS]""" if think else \
+            """[MODEL_SETTINGS]{"reasoning_effort": "{none}"}[/MODEL_SETTINGS]"""
+        for (u, a) in messages:
+            context += f"[INST]{u}[/INST]"
+            if a is not None: context += f"{a}"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id
+        ]
+
+    def thinktag(self):
+        return "[THINK]", "[/THINK]"
+
+
+class PromptFormat_gemma(PromptFormat):
+    description = "Gemma"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return ""
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        for (u, a) in messages:
+            context += f"<start_of_turn>user\n"
+            context += f"{u}<end_of_turn>\n"
+            context += f"<start_of_turn>model\n"
+            if a is not None: context += f"{a}<end_of_turn>\n"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<end_of_turn>"),
+            tokenizer.single_id("<start_of_turn>"),
+        ]
+
+class PromptFormat_gemma4(PromptFormat):
+    description = "Gemma4"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            """You are a helpful AI assistant."""
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context = "<|turn>system\n"
+            if think:
+                context += "<|think|>\n"
+            context += system_prompt + "<turn|>\n"
+        for (u, a) in messages:
+            context += f"<|turn>user\n"
+            context += f"{u}<turn|>\n"
+            context += f"<|turn>model\n"
+            if a is not None: context += f"{a}<turn|>\n"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<eos>"),
+            tokenizer.single_id("<turn|>"),
+        ]
+
+    def thinktag(self):
+        return "<|channel>thought", "<channel|>"
+
+class PromptFormat_reka(PromptFormat):
+    description = "Reka Flash 3"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return ""
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        first = True
+        for (u, a) in messages:
+            if first and system_prompt:
+                context += f"human: {system_prompt} {u} <sep> "
+                first = False
+            else:
+                context += f"human: {u} <sep> "
+            context += f"assistant:"
+            if a is not None: context += f" {a} <sep> "
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            "<sep>",
+        ]
+
+    def thinktag(self):
+        return " <reasoning>\n", "</reasoning>"
+
+
+class PromptFormat_cohere(PromptFormat):
+    description = "Cohere"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            "## Task and Context\n"
+            "You help people answer their questions and other requests interactively. You will be asked a very "
+            "wide array of requests on all kinds of topics. You should focus on serving the user's needs as "
+            "best you can, which will be wide-ranging.\n\n"
+            "## Style Guide\n"
+            "Unless the user asks for a different style of answer, you should answer in full sentences, using "
+            "proper grammar and spelling."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
+            context += system_prompt
+            context += "<|END_OF_TURN_TOKEN|>"
+        for (u, a) in messages:
+            context += "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+            context += u
+            context += "<|END_OF_TURN_TOKEN|>"
+            context += "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+            if a is not None:
+                context += a
+                context += "<|END_OF_TURN_TOKEN|>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            "<|END_OF_TURN_TOKEN|>",
+        ]
+
+
+class PromptFormat_dots(PromptFormat):
+    description = "Dots"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return "You are a helpful assistant."
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += "<|system|>"
+            context += system_prompt
+            context += "<|endofsystem|>"
+        for (u, a) in messages:
+            context += "<|userprompt|>"
+            context += u
+            context += "<|endofuserprompt|>"
+            context += "<|response|>"
+            if a is not None:
+                context += a
+                context += "<|endofresponse|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|endofresponse|>"),
+            "<|endofresponse|>",
+        ]
+
+    def thinktag(self):
+        return "<|sec-cot|>", "<|sec-end-cot|>"
+
+
+class PromptFormat_ernie(PromptFormat):
+    description = "Ernie"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return "You are a helpful assistant."
+
+    def format(self, system_prompt, messages, think):
+        context = "<|begin_of_sentence|>"
+        if system_prompt:
+            context += system_prompt
+            context += "\n"
+        for (u, a) in messages:
+            context += "User: "
+            context += u
+            context += "\n"
+            context += "Assistant: "
+            if a is not None:
+                context += a
+                context += "<|end_of_sentence|>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|end_of_sentence|>")
+        ]
+
+
+class PromptFormat_smollm3(PromptFormat):
+    description = "SmolLM3 format (ChatML)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        from datetime import datetime
+        today_str = datetime.today().strftime("%d %B %Y")
+        sp = (
+            "## Metadata\n"
+            "\n"
+            "Knowledge Cutoff Date: June 2025\n"
+            f"Today Date: {today_str}\n"
+            f"Reasoning Mode: {'/think' if think else '/no_think'}\n"
+            "\n"
+            "## Custom Instructions\n"
+            "\n"
+        )
+        if think:
+            sp += (
+                "You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves "
+                "thoroughly exploring questions through a systematic thinking process before providing the final precise "
+                "and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, "
+                "exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking "
+                "process. Please structure your response into two main sections: Thought and Solution using the specified "
+                "format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning "
+                "process in steps. Each step should include detailed considerations such as analysing questions, "
+                "summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, "
+                "refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, "
+                "explorations, and reflections from the Thought section, systematically present the final solution that "
+                "you deem correct. The Solution section should be logical, accurate, and concise and detail necessary "
+                "steps needed to reach the conclusion.\n\n"
+            )
+        else:
+            sp += "You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n"
+        return sp
+
+    def format(self, system_prompt, messages, think):
+        context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>\n"
+            context += f"<|im_start|>assistant\n"
+            if a is not None: context += f"{a}<|im_end|>\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+
+class PromptFormat_commanda(PromptFormat):
+    description = "Command-A (Cohere variant)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        # Abridged version
+        return (
+            "You are a helpful AI assistant.\n"
+            "\n"
+            "Your information cutoff date is June 2024.\n"
+            "\n"
+            "You help people answer their questions and other requests interactively. You will be asked a very "
+            "wide array of requests on all kinds of topics. Focus on serving the user's needs as best you can, "
+            "which will be wide-ranging.\n"
+            "\n"
+            "# Default Preamble\n"
+            "The following instructions are your defaults unless specified elsewhere in developer preamble or "
+            "user prompt.\n"
+            "- Your name is Command.\n"
+            "- You are a large language model built by Cohere.\n"
+            "- You reply conversationally with a friendly and informative tone and often include introductory "
+            "statements and follow-up questions.\n"
+            "- If the input is ambiguous, ask clarifying follow-up questions.\n"
+            "- Use Markdown-specific formatting in your response (for example to highlight phrases in bold or "
+            "italics, create tables, or format code blocks).\n"
+            "- Avoid using LaTeX to generate mathematical notation for complex equations.\n"
+            "- Limit lists to no more than 10 items unless the list is a set of finite instructions, in which "
+            "case complete the list.\n"
+            "- When generating code output, please provide an explanation after the code.\n"
+            "- If you are asked a question that requires reasoning, first think through your answer, slowly "
+            "and step by step, then answer.\n"
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
+            context += system_prompt
+            context += "<|END_OF_TURN_TOKEN|>"
+        for (u, a) in messages:
+            context += "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+            context += u
+            context += "<|END_OF_TURN_TOKEN|>"
+            context += "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>"
+            if a is not None:
+                context += a
+                context += "<|END_RESPONSE|><|END_OF_TURN_TOKEN|>"
+        return context
+
+    def add_bos(self):
+        return True  # HF template uses double BOS token
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|END_RESPONSE|>"),
+            tokenizer.single_id("<|END_OF_TURN_TOKEN|>"),
+            "<|END_OF_TURN_TOKEN|>",
+        ]
+
+
+class PromptFormat_exaone(PromptFormat):
+    description = "EXAONE (EXAONE4)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        # Abridged version
+        return (
+            "You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += "[|system|]\n"
+            context += system_prompt
+            context += "[|endofturn|]\n"
+        for (u, a) in messages:
+            context += "[|user|]\n"
+            context += u
+            context += "[|endofturn|]\n"
+            context += "[|assistant|]\n"
+            if a is not None:
+                context += a
+                context += "[|endofturn|]\n"
+        return context
+
+    def add_bos(self):
+        return False  # HF template uses double BOS token
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("[|endofturn|]"),
+            "[|endofturn|]",
+        ]
+
+
+class PromptFormat_seed(PromptFormat):
+    description = "Seed-OSS"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.thinking_budget = 1024
+
+    def set_special(self, spc: dict):
+        self.thinking_budget = spc.get("thinking_budget", self.thinking_budget)
+
+    def default_system_prompt(self, think):
+        if think:
+            budget_reflections_v05 = {
+                0: 0,
+                512: 128,
+                1024: 256,
+                2048: 512,
+                4096: 512,
+                8192: 1024,
+                1e20: 1024
+            }
+            ns_interval = budget_reflections_v05[min([k for k in budget_reflections_v05 if k >= self.thinking_budget])]
+            return (
+                f"You are an intelligent assistant with reflective ability. In the process of thinking and reasoning, "
+                f"you need to strictly follow the thinking budget, which is {self.thinking_budget}. That is, you need to "
+                f"complete your thinking within {self.thinking_budget} tokens and start answering the user's questions. "
+                f"You will reflect on your thinking process every {ns_interval} tokens, stating how many tokens have "
+                f"been used and how many are left."
+            )
+        else:
+            return (
+                "You are an intelligent assistant that can answer questions in one step without the need for reasoning "
+                "and thinking, that is, your thinking budget is 0. Next, please skip the thinking process and directly "
+                "start answering the user's questions."
+            )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += "<seed:bos>system\n"
+            context += system_prompt
+            context += "<seed:eos>"
+        for (u, a) in messages:
+            context += "<seed:bos>user\n"
+            context += u
+            context += "<seed:eos>"
+            context += "<seed:bos>assistant\n"
+            if a is not None:
+                context += a
+                context += "<seed:eos>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<seed:eos>"),
+            "<seed:eos>",
+        ]
+
+    def thinktag(self):
+        return "<seed:think>", "</seed:think>"
+
+
+class PromptFormat_apertus(PromptFormat):
+    description = "Apertus"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        from datetime import datetime
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        return (
+            f"You are Apertus, a helpful assistant created by the SwissAI initiative.\n"
+            f"Knowledge cutoff: 2024-04\n"
+            f"Current date: {today_str}"
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "<s>"
+        if system_prompt:
+            context += "<|system_start|>"
+            context += system_prompt
+            context += "<|system_end|>"
+        context += "<|developer_start|>Deliberation: "
+        context += "enabled" if think else "disabled"
+        context += "\nTool Capabilities: disabled<|developer_end|>"
+        for (u, a) in messages:
+            context += "<|user_start|>"
+            context += u
+            context += "<|user_end|>"
+            context += "<|assistant_start|>"
+            if a is not None:
+                context += a
+                context += "<|assistant_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|assistant_end|>"),
+            "<|assistant_end|>",
+        ]
+
+    def thinktag(self):
+        return None, None
+
+
+class PromptFormat_minimax(PromptFormat):
+    description = "MiniMax"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "]~!b["
+        if system_prompt:
+            context += "]~b]system\n"
+            context += system_prompt
+            context += "[e~[\n"
+        for (u, a) in messages:
+            context += "]~b]user\n"
+            context += u
+            context += "[e~[\n"
+            context += "]~b]ai\n"
+            if a is not None:
+                context += a
+                context += "[e~[\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("[e~["),
+            "[e~[",
+        ]
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+
+class PromptFormat_hy3(PromptFormat):
+    description = "Hy3"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "<｜hy_begin_of_sentence:opensource｜>"
+        if system_prompt:
+            context += system_prompt
+        context += "<｜reasoning_mode:opensource｜>reasoning_effort:"
+        context += "low" if think else "no_think"
+        for (u, a) in messages:
+            context += "<｜hy_User:opensource｜>"
+            context += u
+            context += "<｜hy_Assistant:opensource｜>"
+            if a is not None:
+                context += "<think:opensource></think:opensource>"
+                context += a
+                context += "<｜hy_eos:opensource｜>"
+            elif not think:
+                context += "<think:opensource></think:opensource>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think:opensource>", "</think:opensource>"
+
+
+class PromptFormat_gptoss(PromptFormat):
+    description = "GPT-OSS"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        from datetime import datetime
+        self.today_str = datetime.today().strftime("%Y-%m-%d")
+
+    def default_system_prompt(self, think):
+        return ""
+
+    def format(self, system_prompt, messages, think):
+        context = (
+            f"<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"
+            f"Knowledge cutoff: 2024-06\n"
+            f"Current date: {self.today_str}\n\n"
+            f"Reasoning: {'high' if think else 'low'}\n\n"
+            f"# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\n"
+        )
+        if system_prompt:
+            context += system_prompt.strip() + "\n\n"
+        context += "<|end|>"
+        for (u, a) in messages:
+            context += "<|start|>user<|message|>"
+            context += u
+            context += "<|end|>"
+            if a is not None:
+                context += "<|start|>assistant"
+                if a.startswith("<|channel|>"):
+                    # Keep only the final-channel message and drop the analysis from the stored
+                    # context, per the harmony convention. The terminating <|return|> was consumed
+                    # as a stop condition, so close with <|end|>
+                    tag = "<|channel|>final<|message|>"
+                    p = a.rfind(tag)
+                    if p >= 0:
+                        context += tag + a[p + len(tag):] + "<|end|>"
+                    else:
+                        # No final message (analysis truncated?); keep the raw chain
+                        context += a + "<|end|>"
+                else:
+                    context += "<|channel|>final<|message|>" + a + "<|end|>"
+            else:
+                context += "<|start|>assistant"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|return|>"),
+        ]
+
+    def thinktag(self):
+        # Harmony channels are structural output, not think tags.
+        return None, None
+
+    def is_harmony_like(self):
+        return True
+
+
+class PromptFormat_laguna(PromptFormat):
+    description = "Laguna 2.1"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "〈|EOS|〉"
+        if system_prompt:
+            context += "<system>"
+            context += system_prompt
+            context += "</system>\n"
+        for (u, a) in messages:
+            context += "<user>"
+            context += u
+            context += "</user>\n"
+            context += "<assistant>"
+            if a is not None:
+                context += a
+                context += "</assistant>\n"
+        return context
+
+    def add_bos(self):
+        # format() already emits the (misleadingly named) BOS token 〈|EOS|〉 as a literal
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+
+class PromptFormat_kimi(PromptFormat):
+    description = "Moonshot ChatML variant used by Kimi K2, Moonlight etc."
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|im_system|>system<|im_middle|>{system_prompt}<|im_end|>"
+        for (u, a) in messages:
+            context += f"<|im_user|>user<|im_middle|>{u}<|im_end|>"
+            context += f"<|im_assistant|>assistant<|im_middle|>"
+            if a is not None: context += f"{a}<|im_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<|im_end|>")
+        ]
+
+
+class PromptFormat_deepseek(PromptFormat):
+    description = "Deepseek"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|begin▁of▁sentence|>{system_prompt}"
+        for (u, a) in messages:
+            context += f"<|User|>{u}"
+            context += f"<|Assistant|>"
+            if not think:
+                context += f"<|end_of_thought|>"
+            if a is not None: context += f"{a}"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<|User|>")
+        ]
+
+
+class PromptFormat_ds4(PromptFormat):
+    description = "Deepseek-V4"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<｜begin▁of▁sentence｜>{system_prompt}"
+        for (u, a) in messages:
+            context += f"<｜User｜>{u}"
+            context += f"<｜Assistant｜>"
+            if a is not None:
+                if "</think>" in a:
+                    a = a.split("</think>", 1)[1].lstrip("\n")
+                context += f"</think>{a}"
+                context += f"<｜end▁of▁sentence｜>"
+            else:
+                context += f"<think>" if think else f"</think>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<｜User｜>")
+        ]
+
+
+class PromptFormat_spark(PromptFormat):
+    description = "Spark-X2.5"
+
+    DEFAULT_SYSTEM = "you are a helpful assistant."
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return self.DEFAULT_SYSTEM
+
+    def format(self, system_prompt, messages, think):
+        # chat_template.jinja: each message is <｜start▁of▁sentence｜><|Role|>...<｜end▁of▁sentence｜>
+        # with ASCII-bar role tokens. The system block always carries the template's default
+        # line; a custom system prompt is appended after a blank line. Completed assistant
+        # turns render as a closed think block plus the answer (earlier reasoning dropped);
+        # the open turn gets </think> in plain mode, and in reasoning mode chat.py appends the
+        # <think> opener itself (thinktag)
+        bos, eos = "<｜start▁of▁sentence｜>", "<｜end▁of▁sentence｜>"
+        system = self.DEFAULT_SYSTEM
+        if system_prompt and system_prompt.strip() != self.DEFAULT_SYSTEM:
+            system += "\n\n" + system_prompt.strip()
+        context = f"{bos}<|System|>\n{system}{eos}"
+        for (u, a) in messages:
+            context += f"{bos}<|User|>{u}{eos}"
+            context += f"{bos}<|Bot|>"
+            if a is not None:
+                if "</think>" in a:
+                    a = a.split("</think>", 1)[1].lstrip("\n")
+                context += f"</think>{a}{eos}"
+            elif not think:
+                context += "</think>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<｜start▁of▁sentence｜>")
+        ]
+
+
+class PromptFormat_muse(PromptFormat):
+    description = "Muse Glimmer"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return f"You are a helpful AI assistant."
+
+    def format(self, system_prompt, messages, think):
+        context = "<|begin_of_text|><|start|>system<|message|>"
+        if system_prompt:
+            context += system_prompt.strip() + "\n\n"
+        context += f"Reasoning strength: {'high' if think else 'low'}.\n\n"
+        context += """# Valid recipients: "self", "user".<|eot|>"""
+        for (u, a) in messages:
+            context += f"<|start|>user<|message|>{u}<|eot|>"
+            context += "<|start|>assistant"
+            if a is not None:
+                if a.startswith("to="):
+                    # Raw recipient chain from a completed turn: reasoning addressed to=self,
+                    # answer to=user, joined by <|eom|>. Keep only the final to=user message and
+                    # drop the reasoning from the stored context, like the reference template.
+                    # The final <|eot|> was consumed as a stop condition, so restore it
+                    tag = "to=user<|message|>"
+                    p = a.rfind(tag)
+                    if p >= 0:
+                        context += f" to=user<|message|>{a[p + len(tag):]}<|eot|>"
+                    else:
+                        # No final message (reasoning truncated?); keep the raw chain
+                        context += " " + a + "<|eot|>"
+                else:
+                    context += f" to=user<|message|>{a}<|eot|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        # Recipient chains are structural output, not think tags
+        return None, None
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<|eot|>")
+        ]
+
+    def is_harmony_like(self):
+        return True
+
+    def harmony_tags(self):
+        # A turn is a chain of <|start|>assistant to={recipient}<|message|>... messages joined by
+        # <|eom|>. The first header arrives without its <|start|>assistant prefix (it's part of
+        # the prompt), hence the prime. "to=" alone can't be the channel tag: it's plain text
+        # that may occur inside a message
+        return {
+            "channel_tag": "<|start|>assistant",
+            "message_tag": "<|message|>",
+            "end_tag": "<|eom|>",
+            "prime": "<|start|>assistant",
+            "channel_prefix": "to=",
+        }
+
+
+prompt_formats = {
+    "raw": PromptFormat_raw,
+    "llama3": PromptFormat_llama3,
+    "chatml": PromptFormat_chatml,
+    "qwen35": PromptFormat_qwen35,
+    "phi": PromptFormat_phi,
+    "mistral": PromptFormat_mistral,
+    "mistral3": PromptFormat_mistral3,
+    "gemma": PromptFormat_gemma,
+    "gemma4": PromptFormat_gemma4,
+    "glm": PromptFormat_glm,
+    "reka": PromptFormat_reka,
+    "cohere": PromptFormat_cohere,
+    "dots": PromptFormat_dots,
+    "ernie": PromptFormat_ernie,
+    "smollm3": PromptFormat_smollm3,
+    "commanda": PromptFormat_commanda,
+    "exaone": PromptFormat_exaone,
+    "seed": PromptFormat_seed,
+    "apertus": PromptFormat_apertus,
+    "minimax": PromptFormat_minimax,
+    "gptoss": PromptFormat_gptoss,
+    "hy3": PromptFormat_hy3,
+    "laguna": PromptFormat_laguna,
+    "kimi": PromptFormat_kimi,
+    "deepseek": PromptFormat_deepseek,
+    "ds4": PromptFormat_ds4,
+    "spark": PromptFormat_spark,
+    "muse": PromptFormat_muse,
+    "mimo": PromptFormat_mimo,
+}
