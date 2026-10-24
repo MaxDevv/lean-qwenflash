@@ -1,0 +1,6 @@
+[submodule "exllamav3"]
+	path = exllamav3
+	url = https://github.com/turboderp-org/exllamav3.git
+[submodule "glm53-flash-offload"]
+	path = glm53-flash-offload
+	url = https://github.com/sybil-solutions/glm53-flash-offload.git

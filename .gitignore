@@ -1,0 +1,34 @@
+# This initial checkpoint includes only explicitly selected source and evidence.
+# Local experiments, launchers, runtimes and downloaded artifacts stay on disk.
+/*
+!/.gitignore
+!/README.md
+!/.gitmodules
+!/qwen_offload.py
+!/qwen_server.py
+!/infer.py
+!/benchmark.py
+!/memory_guard.py
+!/download_http.py
+!/append_mtp.py
+!/test_*.py
+/test_qwen_thinking.py
+!/tests/
+!/exllamav3/
+!/glm53-flash-offload/
+!/research/
+/research/*
+!/research/4090-final/
+!/research/4090-long/
+!/research/local-expert-ram-compare/
+/research/4090-final/*
+!/research/4090-final/REPORT.md
+!/research/4090-final/results/
+/research/4090-long/*
+!/research/4090-long/RESUMED-REPORT.md
+!/research/4090-long/results/
+/research/local-expert-ram-compare/*
+!/research/local-expert-ram-compare/REPORT.md
+!/research/local-expert-ram-compare/results/
+__pycache__/
+*.pyc
