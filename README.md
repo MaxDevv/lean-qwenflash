@@ -110,6 +110,15 @@ python infer.py \
 
 ---
 
+## To Do
+
+If I get some free time—or someone wants to contribute or put an agent on it:
+
+- **Lower VRAM:** Adapt and benchmark on 12 GB, and potentially 8 GB GPUs. I expect adapting the existing cache and staging budgets to be relatively straightforward; neither configuration has been tested yet.
+- **Higher VRAM:** Benchmark 24 GB and 32 GB GPUs to see how prefill and decode scale as more experts fit in VRAM.
+
+---
+
 ## Lineage
 
 * [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by turboderp (quantization format & inference runtime).
