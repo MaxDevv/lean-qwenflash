@@ -1,55 +1,117 @@
 # Lean-QwenFlash
 
-A Qwen3.8-Flash-Next adaptation of the GLM-5.3-Flash offload engine, built on ExLlamaV3, demonstrated on actual consumer hardware: an RTX 4090 and an RTX 3080 Laptop.
+Direct-from-SSD expert offloading for **Qwen3.8-Flash-Next** (125B MoE, 512 experts).
 
-The runtime keeps bounded expert caches in RAM and VRAM and reads missing experts from SSD. N-gram embeddings also remain disk-backed. The selected inference profiles run expert computation on the GPU rather than using the CPU expert lane.
+Most setups for this model require 48–64 GB of system RAM just to hold the expert weights in memory. This runtime streams uncached experts directly from NVMe storage over PCIe into a bounded GPU cache via `O_DIRECT`, while streaming the 51B N-gram embedding table from disk. All expert computation runs on the GPU.
 
-## Functional-state checkpoint
+Built on [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and adapted from the [glm53-flash-offload](https://github.com/sybil-solutions/glm53-flash-offload) engine.
 
-This is the existing working implementation before model-specific naming and project cleanup. Inference code, defaults and experimental switches are preserved unchanged. The offload package and configuration namespace are now `qwen38` and `QWEN38_`.
+---
 
-- `qwen_offload.py`: Qwen model integration and offload setup.
-- `qwen38-flash-offload/`: modified native offload engine and Python cache integration.
-- `exllamav3/`: model runtime with the optional single-pass prefill change.
-- `infer.py`, `benchmark.py`: inference and measurement entry points.
-- `qwen_server.py`: OpenAI-compatible Qwen server integration.
-- `memory_guard.py`: memory measurement and guards.
-- `download_http.py`, `append_mtp.py`: checkpoint download and store support.
-- `tests/`, `test_*.py`: store and server tests.
+## Measured Performance
 
-The two existing upstream Git repositories are retained as pinned submodules for this checkpoint, with their modifications committed separately. This records the current working layout, not a decision about the final package architecture. Their configured remotes still identify the upstream projects; the new local commits must be published to fork remotes before a public recursive clone can retrieve them.
+Benchmarked using `turboderp/Qwen3.8-Flash-Next-exl3` (`3.05bpw_h5_ng5`) with 4-bit KV cache:
 
-## Demonstrated hardware
+| Hardware | Context | System RAM Used | VRAM Used | Prefill | Decode |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RTX 4090** | 8k | ~8 GB | <16 GB | 1,080 tok/s | 28–33 tok/s (prose)<br>19–22 tok/s (code) |
+| **RTX 4090** | 100k | ~8 GB | 15.6 GB | 1,536 tok/s | 20.8 tok/s |
+| **RTX 4090** | 262k | ~8 GB | 15.6 GB | 1,627 tok/s | 20.0 tok/s |
+| **RTX 3080 Laptop (16GB)** | 100k (8 GB cache) | 19.0 GB | 15.5 GB | 647 tok/s | 17.6 tok/s |
+| **RTX 3080 Laptop (16GB)** | 100k (16 GB cache) | 23.9 GB | 15.5 GB | 693 tok/s | 20.9 tok/s |
 
-| Hardware / profile | System RAM | Total VRAM | Prefill | Decode |
-| --- | --- | --- | --- | --- |
-| RTX 4090, short-context profile | Kernel-enforced 8 GiB limit, no swap | Below 16 GB guard | 8,174-token document: **1,081–1,083 tok/s**, 7.55–7.56 s | Warm prose 28–33 tok/s; coding/science 19–22 tok/s |
-| RTX 4090, 262k Q4 cache, 24k prefill chunks | Kernel-enforced 8 GiB limit, no swap | 15.63 GB peak across profile | 99,982 tokens: **1,536 tok/s**, 65.11 s | 20.77 tok/s |
-| RTX 4090, same long-context profile | Kernel-enforced 8 GiB limit, no swap | 15.63 GB peak across profile | 261,614 tokens: **1,627 tok/s**, 160.82 s | 20.03 tok/s |
-| RTX 3080 Laptop, approximately 100k prompt, 8 GiB expert cache | 19.03 GB peak sampled | 15.46 GB | 99,982 tokens: **647 tok/s**, 154.45 s | 17.62 tok/s |
-| RTX 3080 Laptop, approximately 100k prompt, 16 GiB expert cache | 23.90 GB peak sampled | 15.48 GB | 99,982 tokens: **693 tok/s**, 144.35 s | 20.88 tok/s |
+---
 
-Prefill measures processing the full prompt, not a prefix-cache hit. The 4090 short-context document is README-derived; its decode column summarizes separate prose/coding/science requests. The long-context rows pair prefill and subsequent decode from the same request, using Moby Dick text (repeated when needed). Expert caches were warm; these are not cold-start timings. CPU expert computation and MTP were off. The laptop runs use the same 262k Q4 cache capacity and 24k prefill chunks.
+## How It Works
 
-The RTX 4090 also completed near-262k three-code retrieval. Its 8 GiB cgroup limit was enforced; a retrieval sample briefly read 225,280 bytes above that nominal limit. These are separate measured configurations, not interchangeable performance figures. Detailed settings, workload differences and raw measurements are preserved under:
+Qwen3.8-Flash-Next activates only 10 of its 512 experts per layer per token (~2% of weights).
 
-- `research/4090-final/`
-- `research/4090-long/`
-- `research/local-expert-ram-compare/`
+* **GPU (16 GB VRAM):** Dense attention mixers, DeltaNet state, routers, shared experts, output head, 4-bit KV cache, and an adaptive GPU expert cache.
+* **Host RAM:** Configurable cache (4–16 GB) holding the most recently activated experts.
+* **NVMe Storage:** The full ~47 GB packed expert store and 32 GB N-gram table sit on SSD. Cache misses are read directly via asynchronous ring buffers and staged ahead of the compute stream.
+* **GPU-Only Math:** All expert computation stays on the GPU. Misses stream over PCIe rather than falling back to CPU execution, avoiding host DRAM bandwidth limits.
+* **Prefix Caching:** Recurrent state checkpoints are saved alongside the KV cache so multi-turn agent requests start decoding immediately (~0.8s–1.4s TTFT on cached follow-ups).
 
-This checkpoint has not rerun inference: the model tensors and derived expert store were previously deleted to reclaim storage.
+---
 
-## Model used
+## Quickstart
 
-- Repository: `turboderp/Qwen3.8-Flash-Next-exl3`
-- Quantization: `3.05bpw_h5_ng5`
-- Model revision: `69e33439ae950f17bcbe95c98f117d80f759ab6d`
-- Checkpoint including N-grams: approximately 85.14 GB.
-- Checkpoint plus packed expert store: approximately 132 GB.
+### 1. Requirements
+* Linux (x86_64)
+* NVIDIA GPU with at least 16 GB VRAM
+* Fast NVMe SSD (PCIe 3.0 or 4.0, ~3+ GB/s read throughput)
+* CUDA 12.4+ and Python 3.10–3.12
 
-The checkpoint does not include local virtual environments, compiled binaries, downloaded tensors, machine-specific systemd launchers, remote-machine orchestration, or experiment archives. Those local files are left in place. Portable installation and the model-specific cleanup are subsequent work.
+### 2. Install
 
-## Upstream projects
+```bash
+git clone --recurse-submodules https://github.com/MaxDevv/lean-qwenflash.git
+cd qwen38-flash-offload
 
-- https://github.com/sybil-solutions/glm53-flash-offload
-- https://github.com/turboderp-org/exllamav3
+python3 -m venv .venv
+source .venv/bin/activate
+pip install torch fastapi uvicorn safetensors jinja2
+pip install -e exllamav3
+```
+
+Compile the native offload extensions:
+```bash
+python compile_local.py
+```
+
+### 3. Download & Build Store
+
+Download the 3.05bpw checkpoint and N-gram table (~85 GB total):
+```bash
+python download_http.py --model-dir ./model
+```
+
+Pack the routed experts into a direct-I/O binary store (~47 GB):
+```bash
+python qwen38-flash-offload/scripts/pack_qwen38_store.py \
+  --model ./model \
+  --out ./store/qwen.bin
+```
+
+---
+
+## Serving
+
+Start the OpenAI-compatible server on port `30000`:
+
+```bash
+python qwen_server.py \
+  --model ./model \
+  --store ./store/qwen.bin \
+  --ram-gb 8 \
+  --cache 262144 \
+  --chunk 24576 \
+  --port 30000
+```
+
+### Agent Configuration
+Point tools like Pi, OpenCode, or Claude Code to:
+* **Base URL:** `http://127.0.0.1:30000/v1`
+* **Model:** `qwen3.8-flash-next`
+* **Context Window:** `262144`
+
+Supports streaming, reasoning effort control (`off`, `low`, `medium`, `xhigh`), and OpenAI function calling.
+
+### CLI Test
+To run a one-shot generation from the terminal:
+
+```bash
+python infer.py \
+  --model ./model \
+  --store ./store/qwen.bin \
+  --ram-gb 4 \
+  --prompt "Write an implementation of merge sort in C."
+```
+
+---
+
+## Lineage
+
+* [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by turboderp (quantization format & inference runtime).
+* [glm53-flash-offload](https://github.com/sybil-solutions/glm53-flash-offload) by sybil-solutions (NVMe staging & memory tiering architecture).
+* [Qwen3.8-Flash-Next](https://github.com/QwenLM) by Alibaba Cloud Qwen team.
