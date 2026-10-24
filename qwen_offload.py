@@ -9,19 +9,19 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
          mtp=0, embed_disk=False, cache_quant=None):
     import torch
     model_dir=Path(model_dir).resolve(); store=Path(store).resolve()
-    sys.path.insert(0, str(ROOT / 'glm53-flash-offload' / 'glm53'))
+    sys.path.insert(0, str(ROOT / 'qwen38-flash-offload' / 'qwen38'))
     env = {
-        'GLM53_NV': '2', 'GLM53_EC': '1', 'GLM53_NV_STORE': str(store),
-        'GLM53_NV_RAM_GB': str(ram_gb), 'GLM53_NV_CPU': str(int(cpu)),
-        'GLM53_RCS_GB': '0.25',
-        'GLM53_NV_EXCL': '1', 'GLM53_NV_PREFETCH': '0',
-        'GLM53_NV_THREADS': '12', 'GLM53_NV_READER_CPUS': '2-11',
-        'GLM53_NV_CTL_CPU': '1', 'GLM53_NV_CPU_CPUS': '2-7',
-        'GLM53_NV_PIECE_KB': '256', 'GLM53_NV_PF_RING': '512',
-        'GLM53_NV_PF_QD': '24', 'GLM53_NV_VRING': '24',
-        'GLM53_EC_STAGE_GB': '1.1', 'GLM53_EC_STAGE_MIN': '512',
-        'GLM53_EC_ELASTIC_GB': '6', 'GLM53_EC_RESERVE_GB': '1.7',
-        'GLM53_NV_COPY_GRID': '24', 'GLM53_EC_COPY_GRID': '24',
+        'QWEN38_NV': '2', 'QWEN38_EC': '1', 'QWEN38_NV_STORE': str(store),
+        'QWEN38_NV_RAM_GB': str(ram_gb), 'QWEN38_NV_CPU': str(int(cpu)),
+        'QWEN38_RCS_GB': '0.25',
+        'QWEN38_NV_EXCL': '1', 'QWEN38_NV_PREFETCH': '0',
+        'QWEN38_NV_THREADS': '12', 'QWEN38_NV_READER_CPUS': '2-11',
+        'QWEN38_NV_CTL_CPU': '1', 'QWEN38_NV_CPU_CPUS': '2-7',
+        'QWEN38_NV_PIECE_KB': '256', 'QWEN38_NV_PF_RING': '512',
+        'QWEN38_NV_PF_QD': '24', 'QWEN38_NV_VRING': '24',
+        'QWEN38_EC_STAGE_GB': '1.1', 'QWEN38_EC_STAGE_MIN': '512',
+        'QWEN38_EC_ELASTIC_GB': '6', 'QWEN38_EC_RESERVE_GB': '1.7',
+        'QWEN38_NV_COPY_GRID': '24', 'QWEN38_EC_COPY_GRID': '24',
         'EXL3_NGRAM_STREAM': '1', 'QWEN_VRAM_LIMIT_BYTES': '16000000000',
         'MAX_JOBS': '4', 'TORCH_CUDA_ARCH_LIST': '8.9',
     }
@@ -38,9 +38,9 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
     if os.environ.get('QWEN_PREBUILT_EXT') == '1':
         # Explicit opt-in for the recovered binaries built with this same Torch/CUDA ABI.
         import importlib.util
-        for module, directory, name in ((nv_tier,'nv','glm53_nv'),
-                                        (expert_cache,'ec','glm53_ec'), (nv2,'nv2','glm53_nv2')):
-            path=ROOT/'glm53-flash-offload'/'build'/directory/(name+'.so')
+        for module, directory, name in ((nv_tier,'nv','qwen38_nv'),
+                                        (expert_cache,'ec','qwen38_ec'), (nv2,'nv2','qwen38_nv2')):
+            path=ROOT/'qwen38-flash-offload'/'build'/directory/(name+'.so')
             spec=importlib.util.spec_from_file_location(name,path)
             native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native)
             module._EXT=native

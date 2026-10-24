@@ -4,7 +4,7 @@ from pathlib import Path
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--model',required=True); ap.add_argument('--store',required=True); a=ap.parse_args()
-    p=Path(__file__).resolve().parent/'glm53-flash-offload/scripts/pack_glm53_store.py'
+    p=Path(__file__).resolve().parent/'qwen38-flash-offload/scripts/pack_qwen38_store.py'
     spec=importlib.util.spec_from_file_location('packer',p); packer=importlib.util.module_from_spec(spec); spec.loader.exec_module(packer)
     store=Path(a.store); manifest=store.with_suffix('.json'); meta=json.loads(manifest.read_text())
     if meta.get('mtp_layer_li') is not None: print('MTP already packed'); return

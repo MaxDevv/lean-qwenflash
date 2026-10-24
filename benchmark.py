@@ -39,7 +39,7 @@ def main():
     from exllamav3 import Generator,Job,GreedySampler
     gen=None
     eos=tok.single_id('<|im_end|>')
-    result={'args':dict(vars(a)),'runs':[],'started':time.time(),'env':{k:v for k,v in os.environ.items() if k.startswith(('GLM53_','EXL3_','QWEN_'))}}
+    result={'args':dict(vars(a)),'runs':[],'started':time.time(),'env':{k:v for k,v in os.environ.items() if k.startswith(('QWEN38_','EXL3_','QWEN_'))}}
     out=Path(a.out); out.parent.mkdir(parents=True,exist_ok=True)
     # Exercise actual disk gathers and independently implemented hashing/trellis decoding.
     result['ngram_validation']=[]

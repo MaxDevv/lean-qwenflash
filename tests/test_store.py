@@ -1,7 +1,7 @@
 import importlib.util,json,struct,tempfile,unittest
 from pathlib import Path
 
-path=Path(__file__).resolve().parents[1]/'glm53-flash-offload/scripts/pack_glm53_store.py'
+path=Path(__file__).resolve().parents[1]/'qwen38-flash-offload/scripts/pack_qwen38_store.py'
 spec=importlib.util.spec_from_file_location('packer',path); packer=importlib.util.module_from_spec(spec); spec.loader.exec_module(packer)
 
 class StoreGeometry(unittest.TestCase):

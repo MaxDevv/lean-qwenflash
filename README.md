@@ -6,10 +6,10 @@ The runtime keeps bounded expert caches in RAM and VRAM and reads missing expert
 
 ## Functional-state checkpoint
 
-This is the existing working implementation before model-specific naming and project cleanup. Inference code, defaults and experimental switches are preserved unchanged. The inherited `glm53` names are still present.
+This is the existing working implementation before model-specific naming and project cleanup. Inference code, defaults and experimental switches are preserved unchanged. The offload package and configuration namespace are now `qwen38` and `QWEN38_`.
 
 - `qwen_offload.py`: Qwen model integration and offload setup.
-- `glm53-flash-offload/`: modified native offload engine and Python cache integration.
+- `qwen38-flash-offload/`: modified native offload engine and Python cache integration.
 - `exllamav3/`: model runtime with the optional single-pass prefill change.
 - `infer.py`, `benchmark.py`: inference and measurement entry points.
 - `qwen_server.py`: OpenAI-compatible Qwen server integration.

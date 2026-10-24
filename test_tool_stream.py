@@ -2,7 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
-spec=importlib.util.spec_from_file_location('tool_stream',Path(__file__).parent/'glm53-flash-offload/glm53/tool_stream.py')
+spec=importlib.util.spec_from_file_location('tool_stream',Path(__file__).parent/'qwen38-flash-offload/qwen38/tool_stream.py')
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 split=module.split_tool_stream
 

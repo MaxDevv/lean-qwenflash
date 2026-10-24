@@ -48,7 +48,7 @@ def main():
     model,config,cache,tok,pools,tables,draft_model,draft_cache=load(
         cli.model,cli.store,cli.chunk,cli.cache,cli.ram_gb,cpu=False,mtp=0,embed_disk=True,cache_quant=4)
     # Reuse the existing HTTP, SSE, disconnect cancellation, sampling and stats implementation.
-    spec=importlib.util.spec_from_file_location('qwen_http_backend',ROOT/'glm53-flash-offload/glm53/serve.py')
+    spec=importlib.util.spec_from_file_location('qwen_http_backend',ROOT/'qwen38-flash-offload/qwen38/serve.py')
     backend=importlib.util.module_from_spec(spec);spec.loader.exec_module(backend)
     backend.args=SimpleNamespace(model_dir=cli.model,cache_size=cli.cache,chunk_size=cli.chunk,cache_quant='4',
         host=cli.host,port=cli.port,served_name=cli.served_name,max_batch_size=1,max_q_size=8,
