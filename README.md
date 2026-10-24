@@ -1,5 +1,7 @@
 # Lean-QwenFlash
 
+**Qwen3.8-Flash-Next at full 262k context on 8 GB RAM and 16 GB VRAM—20 tok/s generation and 1,600 tok/s prefill.**
+
 Direct-from-SSD expert offloading for **Qwen3.8-Flash-Next** (125B MoE, 512 experts).
 
 Most setups for this model require 48–64 GB of system RAM just to hold the expert weights in memory. This runtime streams uncached experts directly from NVMe storage over PCIe into a bounded GPU cache via `O_DIRECT`, while streaming the 51B N-gram embedding table from disk. All expert computation runs on the GPU.
