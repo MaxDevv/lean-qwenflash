@@ -21,13 +21,17 @@ The two existing upstream Git repositories are retained as pinned submodules for
 
 ## Demonstrated hardware
 
-| Hardware / profile | System RAM | Total VRAM | Decode |
-| --- | --- | --- | --- |
-| RTX 4090, short-context profile | Kernel-enforced 8 GiB limit, no swap | Below 16 GB guard | Warm prose 28–33 tok/s; coding/science 19–22 tok/s |
-| RTX 3080 Laptop, approximately 100k prompt, 8 GiB expert cache | 19.03 GB peak sampled | 15.46 GB | 17.62 tok/s |
-| RTX 3080 Laptop, approximately 100k prompt, 16 GiB expert cache | 23.90 GB peak sampled | 15.48 GB | 20.88 tok/s |
+| Hardware / profile | System RAM | Total VRAM | Prefill | Decode |
+| --- | --- | --- | --- | --- |
+| RTX 4090, short-context profile | Kernel-enforced 8 GiB limit, no swap | Below 16 GB guard | 8,174-token document: **1,081–1,083 tok/s**, 7.55–7.56 s | Warm prose 28–33 tok/s; coding/science 19–22 tok/s |
+| RTX 4090, 262k Q4 cache, 24k prefill chunks | Kernel-enforced 8 GiB limit, no swap | 15.63 GB peak across profile | 99,982 tokens: **1,536 tok/s**, 65.11 s | 20.77 tok/s |
+| RTX 4090, same long-context profile | Kernel-enforced 8 GiB limit, no swap | 15.63 GB peak across profile | 261,614 tokens: **1,627 tok/s**, 160.82 s | 20.03 tok/s |
+| RTX 3080 Laptop, approximately 100k prompt, 8 GiB expert cache | 19.03 GB peak sampled | 15.46 GB | 99,982 tokens: **647 tok/s**, 154.45 s | 17.62 tok/s |
+| RTX 3080 Laptop, approximately 100k prompt, 16 GiB expert cache | 23.90 GB peak sampled | 15.48 GB | 99,982 tokens: **693 tok/s**, 144.35 s | 20.88 tok/s |
 
-The RTX 4090 also completed near-262k-context generation and retrieval. These are separate measured configurations, not interchangeable performance figures. Detailed settings, workload differences and raw measurements are preserved under:
+Prefill measures processing the full prompt, not a prefix-cache hit. The 4090 short-context document is README-derived; its decode column summarizes separate prose/coding/science requests. The long-context rows pair prefill and subsequent decode from the same request, using Moby Dick text (repeated when needed). Expert caches were warm; these are not cold-start timings. CPU expert computation and MTP were off. The laptop runs use the same 262k Q4 cache capacity and 24k prefill chunks.
+
+The RTX 4090 also completed near-262k three-code retrieval. Its 8 GiB cgroup limit was enforced; a retrieval sample briefly read 225,280 bytes above that nominal limit. These are separate measured configurations, not interchangeable performance figures. Detailed settings, workload differences and raw measurements are preserved under:
 
 - `research/4090-final/`
 - `research/4090-long/`
