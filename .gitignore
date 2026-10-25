@@ -3,6 +3,7 @@
 /*
 !/.gitignore
 !/README.md
+!/media/
 !/qwen_offload.py
 !/qwen_server.py
 !/infer.py
