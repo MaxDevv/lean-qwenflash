@@ -1,12 +1,17 @@
-"""Parallel, resumable exact-range HF downloader. Run only on the remote VM."""
-import os,json,time,urllib.request,concurrent.futures as cf,threading,mmap
+"""Parallel, resumable exact-range HF downloader."""
+import argparse,os,json,time,urllib.request,concurrent.futures as cf,threading,mmap
 from pathlib import Path
 from huggingface_hub import HfApi
 
-base=Path(os.environ.get('QWEN_WORK_ROOT','/content/qwen-opt'))
-root=base/'model'; root.mkdir(exist_ok=True)
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--model-dir', type=Path,
+                    default=Path(os.environ.get('QWEN_WORK_ROOT','.'))/'model',
+                    help='Checkpoint destination (default: ./model, or $QWEN_WORK_ROOT/model)')
+args=parser.parse_args()
+root=args.model_dir.expanduser(); root.mkdir(parents=True,exist_ok=True)
+base=root.parent
 cg=Path(os.environ.get('QWEN_DOWNLOAD_CGROUP','/sys/fs/cgroup/qwen-download'))
-if os.environ.get('QWEN_DOWNLOAD_JOIN_CGROUP','1')=='1':
+if os.environ.get('QWEN_DOWNLOAD_JOIN_CGROUP','0')=='1':
  (cg/'cgroup.procs').write_text(str(os.getpid()))
 repo='turboderp/Qwen3.8-Flash-Next-exl3'; branch='3.05bpw_h5_ng5'
 info=HfApi().model_info(repo,revision=branch,files_metadata=True)

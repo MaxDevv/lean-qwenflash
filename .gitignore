@@ -10,6 +10,7 @@
 !/benchmark.py
 !/memory_guard.py
 !/download_http.py
+!/compile_local.py
 !/append_mtp.py
 !/test_*.py
 /test_qwen_thinking.py

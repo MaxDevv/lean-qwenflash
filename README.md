@@ -16,7 +16,7 @@ Built on [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and adapted fro
 
 ## Measured Performance
 
-Benchmarked using `turboderp/Qwen3.8-Flash-Next-exl3` (`3.05bpw_h5_ng5`) with 4-bit KV cache:
+Benchmarked using `turboderp/Qwen3.8-Flash-Next-exl3` (`3.05bpw_h5_ng5`) with 4-bit KV cache unless noted:
 
 | Hardware | Context | System RAM Used | VRAM Used | Prefill | Decode |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -25,6 +25,7 @@ Benchmarked using `turboderp/Qwen3.8-Flash-Next-exl3` (`3.05bpw_h5_ng5`) with 4-
 | **RTX 4090** | 262k | ~8 GB | 15.6 GB | 1,627 tok/s | 20.0 tok/s |
 | **RTX 3080 Laptop (16GB)** | 100k (8 GB cache) | 19.0 GB | 15.5 GB | 647 tok/s | 17.6 tok/s |
 | **RTX 3080 Laptop (16GB)** | 100k (16 GB cache) | 23.9 GB | 15.5 GB | 693 tok/s | 20.9 tok/s |
+| **RTX 4090** | 17 tokens (4 GB cache, unquantized KV) | 8.55 GB | 14.90 GB | — | 16.0 tok/s (code) |
 
 ---
 
@@ -56,7 +57,8 @@ cd lean-qwenflash
 
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch fastapi uvicorn safetensors jinja2
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install fastapi uvicorn safetensors jinja2 huggingface_hub
 pip install -e exllamav3
 ```
 
@@ -74,9 +76,11 @@ python download_http.py --model-dir ./model
 
 Pack the routed experts into a direct-I/O binary store (~47 GB):
 ```bash
-python qwen38-flash-offload/scripts/pack_qwen38_store.py \
+mkdir -p ./store
+python qwen38-flash-offload/scripts/pack_qwen38_store.py pack \
   --model ./model \
-  --out ./store/qwen.bin
+  --out-dir ./store \
+  --name qwen
 ```
 
 ---

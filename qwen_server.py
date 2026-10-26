@@ -42,7 +42,7 @@ def main():
     cli=ap.parse_args()
     os.environ['QWEN_EXL3_SOURCE']='1'
     from memory_guard import DeviceMemory,HostMemory
-    gpu=DeviceMemory();host=HostMemory(os.environ['QWEN_GLOBAL_MEMORY_CGROUP'])
+    gpu=DeviceMemory();host=HostMemory(os.environ.get('QWEN_GLOBAL_MEMORY_CGROUP',os.environ.get('QWEN_MEMORY_CGROUP','/sys/fs/cgroup')))
     from qwen_offload import load
     start=time.monotonic()
     model,config,cache,tok,pools,tables,draft_model,draft_cache=load(
