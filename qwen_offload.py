@@ -23,14 +23,32 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
         'QWEN38_EC_ELASTIC_GB': '6', 'QWEN38_EC_RESERVE_GB': '1.7',
         'QWEN38_NV_COPY_GRID': '24', 'QWEN38_EC_COPY_GRID': '24',
         'EXL3_NGRAM_STREAM': '1', 'QWEN_VRAM_LIMIT_BYTES': '16000000000',
-        'MAX_JOBS': '4', 'TORCH_CUDA_ARCH_LIST': '8.9',
+        'MAX_JOBS': '4',
     }
     for k,v in env.items(): os.environ.setdefault(k,v)
     torch.set_num_threads(1)
     torch.cuda.init()
-    _, total = torch.cuda.mem_get_info()
-    # Leave room for CUDA context and non-PyTorch allocations as well as allocator fragmentation.
-    torch.cuda.set_per_process_memory_fraction(15_000_000_000 / total)
+    # JIT-built kernels target the GPU that is present
+    os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '%d.%d' % torch.cuda.get_device_capability())
+    free, total = torch.cuda.mem_get_info()
+    # QWEN_VRAM_LIMIT_BYTES is device-wide, as NVML counts it (DeviceMemory guards the same figure). Under WSL2 CUDA
+    # doesn't see part of what Windows apps use, so the expert cache would overshoot the limit by that much. Measured
+    # here, before this process allocates anything but its context; a gap that is only in the totals (the driver's
+    # reserved memory on bare metal) isn't counted.
+    import memory_guard
+    uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+    nvml = memory_guard.device_memory(uuid if uuid.startswith('GPU-') else 'GPU-' + uuid)
+    if nvml is not None and 'QWEN_VRAM_UNSEEN_BYTES' not in os.environ:
+        nvml_total, nvml_used = nvml
+        unseen = max(0, (nvml_used - (total - free)) - (nvml_total - total))
+        os.environ['QWEN_VRAM_UNSEEN_BYTES'] = str(unseen)
+        if unseen > 64 * 1024 ** 2:
+            print(f'VRAM: other processes use {unseen / 1024 ** 3:.2f} GiB that CUDA does not report here; '
+                  f'counted against the VRAM limit', flush=True)
+    # Leave room for CUDA context and non-PyTorch allocations as well as allocator fragmentation:
+    # QWEN_TORCH_LIMIT_BYTES, else 1 GB under QWEN_VRAM_LIMIT_BYTES; the fraction can't exceed the card.
+    torch_cap = int(os.environ.get('QWEN_TORCH_LIMIT_BYTES', int(os.environ['QWEN_VRAM_LIMIT_BYTES']) - 1_000_000_000))
+    torch.cuda.set_per_process_memory_fraction(min(1.0, torch_cap / total))
     if os.environ.get('QWEN_EXL3_SOURCE')=='1':
         sys.path.insert(0,str(ROOT/'exllamav3'))
     from exllamav3 import model_init

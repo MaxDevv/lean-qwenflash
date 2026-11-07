@@ -338,8 +338,17 @@ class Pool:
         free, total = torch.cuda.mem_get_info(device)
         budget = os.environ.get("QWEN_VRAM_LIMIT_BYTES")
         if budget:
-            free = min(free, int(budget) - (total - free))
+            # device-wide, as NVML counts it; QWEN_VRAM_UNSEEN_BYTES is other processes' VRAM that CUDA doesn't
+            # report here (WSL2: part of what Windows apps use), measured by qwen_offload.load
+            free = min(free, int(budget) - (total - free) - int(os.environ.get("QWEN_VRAM_UNSEEN_BYTES", "0")))
         nst = int(stage_bytes // self.rec) if stage_bytes > 0 else 0
+        if 0 < nst < self.E and os.environ.get("QWEN38_NV") == "2":
+            # nv2's full staging stages every non-cached expert of a layer and asserts len(miss) <= stage_n at the
+            # first prefill, so a stage must hold a whole layer: 512 x 2.46 MB = 1.17 GiB for 4-bit experts, more
+            # than the 1.1 GiB default ("staging overflow 512 > 480"). Other modes keep the configured size.
+            print(f"expert_cache: staging {stage_bytes / 1024 ** 3:.2f} GiB holds {nst} experts < {self.E} per layer; "
+                  f"using {self.E * self.rec / 1024 ** 3:.2f} GiB", flush=True)
+            nst = self.E
         self.stage_n = nst
         self.elastic = float(os.environ.get("QWEN38_EC_ELASTIC_GB", "0")) * 1024 ** 3
         self.stage = None

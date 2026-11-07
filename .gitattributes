@@ -1,0 +1,5 @@
+# Scripts and Python files run inside Linux (WSL or native), so keep LF even in a Windows checkout.
+* text=auto eol=lf
+*.gif binary
+*.png binary
+*.jpg binary

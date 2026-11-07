@@ -32,6 +32,12 @@ def pinned_exact(nbytes, dev_idx):
     """Exact-size pinned host buffer (torch's pinned allocator rounds each block up to a power of two: a 2.72 GB layer
     arena would cost 4 GB). Plain host tensor + cudaHostRegister under the GPU's context (pinned_cuda_view checks the
     pointer's device)."""
+    import wsl_pinned
+    if wsl_pinned.needed(dev_idx):
+        buf, _ = wsl_pinned.alloc(nbytes, dev_idx, "exl3_tiers")
+        t = torch.frombuffer(buf, dtype=torch.uint8, count=nbytes)
+        assert t.is_pinned()
+        return t
     t = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
     with torch.cuda.device(dev_idx):
         r = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 2)   # cudaHostRegisterMapped

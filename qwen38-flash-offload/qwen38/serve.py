@@ -32,6 +32,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tool_stream import split_tool_stream
+from openai_compat import normalize_chat_request
 
 app = FastAPI()
 G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
@@ -371,7 +372,7 @@ def split_reasoning(text):
 
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
-    body = await req.json()
+    body = normalize_chat_request(await req.json())
     kw = dict(body.get("chat_template_kwargs") or {})
     if body.get("reasoning_effort") is not None:
         kw.setdefault("reasoning_effort", body["reasoning_effort"])

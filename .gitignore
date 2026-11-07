@@ -2,6 +2,7 @@
 # Local experiments, launchers, runtimes and downloaded artifacts stay on disk.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/media/
 !/qwen_offload.py

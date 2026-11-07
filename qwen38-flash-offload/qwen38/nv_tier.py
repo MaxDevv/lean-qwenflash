@@ -310,12 +310,16 @@ class HostArena:
         left = nslots
         while left > 0:
             k = min(left, chunk_slots)
-            mm = mmap.mmap(-1, k * slot_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-            a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-            assert a % 4096 == 0
-            with torch.cuda.device(dev_idx):
-                r = torch.cuda.cudart().cudaHostRegister(a, k * slot_bytes, 2)
-            assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
+            import wsl_pinned
+            if wsl_pinned.needed(dev_idx):
+                mm, a = wsl_pinned.alloc(k * slot_bytes, dev_idx, tag)
+            else:
+                mm = mmap.mmap(-1, k * slot_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+                a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                assert a % 4096 == 0
+                with torch.cuda.device(dev_idx):
+                    r = torch.cuda.cudart().cudaHostRegister(a, k * slot_bytes, 2)
+                assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
             t = torch.frombuffer(mm, dtype=torch.uint8, count=4096)
             assert ext.pinned_cuda_view(t, dev_idx).data_ptr() == a, "UVA alias != host address"
             self.maps.append(mm); self.bases.append(a)

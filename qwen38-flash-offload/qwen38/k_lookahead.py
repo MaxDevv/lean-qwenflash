@@ -73,10 +73,14 @@ def prep_model(model):
             continue
         nbytes = w.numel() * w.element_size()
         nb = (nbytes + 4095) // 4096 * 4096
-        mm = mmap.mmap(-1, nb, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-        a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-        r = torch.cuda.cudart().cudaHostRegister(a, nb, 2)
-        assert int(r) == 0, f"cudaHostRegister(embedding) failed: {r}"
+        import wsl_pinned
+        if wsl_pinned.needed(dev_idx):
+            mm, a = wsl_pinned.alloc(nb, dev_idx, "embedding")
+        else:
+            mm = mmap.mmap(-1, nb, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+            a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+            r = torch.cuda.cudart().cudaHostRegister(a, nb, 2)
+            assert int(r) == 0, f"cudaHostRegister(embedding) failed: {r}"
         host = torch.frombuffer(mm, dtype=w.dtype, count=w.numel()).view(w.shape)
         host.copy_(w)
         assert torch.equal(host, w)
