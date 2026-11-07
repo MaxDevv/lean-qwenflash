@@ -66,11 +66,15 @@ def _mapped(nbytes, dev_idx, tag):
     """One page-aligned anon region, cudaHostRegister(Mapped); UVA alias == host address (checked)."""
     from exllamav3.ext import exllamav3_ext as xe
     nbytes = (nbytes + 4095) // 4096 * 4096
-    mm = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-    with torch.cuda.device(dev_idx):
-        r = torch.cuda.cudart().cudaHostRegister(a, nbytes, 2)
-    assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
+    import wsl_pinned
+    if wsl_pinned.needed(dev_idx):
+        mm, a = wsl_pinned.alloc(nbytes, dev_idx, tag)
+    else:
+        mm = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+        with torch.cuda.device(dev_idx):
+            r = torch.cuda.cudart().cudaHostRegister(a, nbytes, 2)
+        assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
     t = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes)
     assert xe.pinned_cuda_view(t[:4096], dev_idx).data_ptr() == a, "UVA alias != host address"
     t.zero_()
