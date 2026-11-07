@@ -39,6 +39,11 @@ def main():
     ap.add_argument('--ram-gb',type=float,required=True);ap.add_argument('--cache',type=int,default=262144)
     ap.add_argument('--chunk',type=int,default=24576);ap.add_argument('--host',default='127.0.0.1')
     ap.add_argument('--port',type=int,default=30000);ap.add_argument('--served-name',default='qwen3.8-flash-next')
+    ap.add_argument('--allow-origin',action='append',default=[],metavar='ORIGIN',
+                    help="Accept requests that carry this Origin header, e.g. from a browser extension or a desktop "
+                         "app ('*': any)")
+    ap.add_argument('--allow-host',action='append',default=[],metavar='NAME',
+                    help='Accept requests addressed to this host name too, e.g. behind a reverse proxy on this machine')
     cli=ap.parse_args()
     os.environ['QWEN_EXL3_SOURCE']='1'
     from memory_guard import DeviceMemory,HostMemory
@@ -116,6 +121,34 @@ def main():
                 'total_vram_current':gpu.sample(),'total_vram_peak':gpu.peak,'vram_limit':gpu.limit}
     print('QWEN_SERVER_LOADED',backend.t_load,'seconds','RAM_CACHE_GiB',cli.ram_gb,'CONTEXT',cli.cache,flush=True)
     import uvicorn
-    uvicorn.run(backend.app,host=cli.host,port=cli.port,log_level='info')
+    uvicorn.run(LocalOnly(backend.app,cli.host in LOCAL_NAMES,cli.allow_origin,cli.allow_host),
+                host=cli.host,port=cli.port,log_level='info')
+
+LOCAL_NAMES=('127.0.0.1','localhost','::1')
+
+class LocalOnly:
+    """Refuses requests from web pages (an Origin header) unless --allow-origin names the origin: otherwise any site
+    open in a browser on this machine could POST to the server on localhost. Bound to localhost (the default), it also
+    refuses requests addressed to a host name other than localhost or an --allow-host name, which is how DNS
+    rebinding gets a page's requests through. Bound to a network address (--host 0.0.0.0), any host name is
+    accepted, as the operator chose."""
+    def __init__(self,app,local=True,origins=(),hosts=()):
+        self.app,self.local=app,local
+        self.origins={o.rstrip('/').lower() for o in origins}
+        self.hosts=set(LOCAL_NAMES)|{h.lower() for h in hosts}
+    async def __call__(self,scope,receive,send):
+        if scope['type']=='http':
+            h=dict(scope['headers'])
+            host=h.get(b'host',b'').decode('latin-1').lower()
+            host=host[1:host.find(']')] if host.startswith('[') else host.rsplit(':',1)[0]
+            origin=h.get(b'origin',b'').decode('latin-1').rstrip('/').lower()
+            web=b'origin' in h and '*' not in self.origins and origin not in self.origins
+            if web or (self.local and host not in self.hosts):
+                body=b'{"error":"refused: a request from a web page, or addressed to another host name"}'
+                await send({'type':'http.response.start','status':403,'headers':[(b'content-type',b'application/json'),
+                            (b'content-length',str(len(body)).encode())]})
+                await send({'type':'http.response.body','body':body})
+                return
+        await self.app(scope,receive,send)
 
 if __name__=='__main__':main()

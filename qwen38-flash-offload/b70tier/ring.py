@@ -38,9 +38,11 @@ ST_NONE, ST_LOADING, ST_READY, ST_ERROR = 0, 1, 2, 3
 class Ring:
     def __init__(self, path, create=False):
         if create:
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+            # owner-only: anyone who can write the ring can change the rows the engine adds into the model's output.
+            # Both containers have to run as the same user.
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
             os.ftruncate(fd, SIZE)
-            os.fchmod(fd, 0o666)
+            os.fchmod(fd, 0o600)
         else:
             fd = os.open(path, os.O_RDWR)
         self.mm = mmap.mmap(fd, SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
