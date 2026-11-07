@@ -29,8 +29,10 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
     torch.set_num_threads(1)
     torch.cuda.init()
     _, total = torch.cuda.mem_get_info()
-    # Leave room for CUDA context and non-PyTorch allocations as well as allocator fragmentation.
-    torch.cuda.set_per_process_memory_fraction(15_000_000_000 / total)
+    # Leave room for CUDA context and non-PyTorch allocations as well as allocator fragmentation:
+    # QWEN_TORCH_LIMIT_BYTES, else 1 GB under QWEN_VRAM_LIMIT_BYTES; the fraction can't exceed the card.
+    torch_cap = int(os.environ.get('QWEN_TORCH_LIMIT_BYTES', int(os.environ['QWEN_VRAM_LIMIT_BYTES']) - 1_000_000_000))
+    torch.cuda.set_per_process_memory_fraction(min(1.0, torch_cap / total))
     if os.environ.get('QWEN_EXL3_SOURCE')=='1':
         sys.path.insert(0,str(ROOT/'exllamav3'))
     from exllamav3 import model_init

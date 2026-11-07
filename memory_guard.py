@@ -28,7 +28,10 @@ class HostMemory:
 class DeviceMemory:
     class Info(C.Structure):
         _fields_=[('total',C.c_ulonglong),('free',C.c_ulonglong),('used',C.c_ulonglong)]
-    def __init__(self,limit=16_000_000_000):
+    def __init__(self,limit=None):
+        # Device-wide (NVML) cap, other processes included: QWEN_VRAM_GUARD_BYTES, else QWEN_VRAM_LIMIT_BYTES
+        if limit is None:
+            limit=int(os.environ.get('QWEN_VRAM_GUARD_BYTES',os.environ.get('QWEN_VRAM_LIMIT_BYTES','16000000000')))
         self.lib=C.CDLL('libnvidia-ml.so.1')
         assert self.lib.nvmlInit_v2()==0
         self.handle=C.c_void_p()
