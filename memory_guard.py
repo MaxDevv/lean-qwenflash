@@ -33,6 +33,21 @@ class HostMemory:
         if self.thread: self.thread.join()
         self.sample()
 
+def device_memory(uuid):
+    """(total, used) VRAM of the GPU with this UUID ('GPU-...') as NVML counts it, every process included (what
+    DeviceMemory guards), or None without NVML."""
+    try:
+        lib=C.CDLL('libnvidia-ml.so.1')
+    except OSError:
+        return None
+    if lib.nvmlInit_v2()!=0:
+        return None
+    handle=C.c_void_p(); info=DeviceMemory.Info()
+    if lib.nvmlDeviceGetHandleByUUID(uuid.encode(),C.byref(handle))!=0 or \
+       lib.nvmlDeviceGetMemoryInfo(handle,C.byref(info))!=0:
+        return None
+    return info.total,info.used
+
 class DeviceMemory:
     class Info(C.Structure):
         _fields_=[('total',C.c_ulonglong),('free',C.c_ulonglong),('used',C.c_ulonglong)]

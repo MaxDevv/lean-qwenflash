@@ -338,7 +338,9 @@ class Pool:
         free, total = torch.cuda.mem_get_info(device)
         budget = os.environ.get("QWEN_VRAM_LIMIT_BYTES")
         if budget:
-            free = min(free, int(budget) - (total - free))
+            # device-wide, as NVML counts it; QWEN_VRAM_UNSEEN_BYTES is other processes' VRAM that CUDA doesn't
+            # report here (WSL2: part of what Windows apps use), measured by qwen_offload.load
+            free = min(free, int(budget) - (total - free) - int(os.environ.get("QWEN_VRAM_UNSEEN_BYTES", "0")))
         nst = int(stage_bytes // self.rec) if stage_bytes > 0 else 0
         if 0 < nst < self.E and os.environ.get("QWEN38_NV") == "2":
             # nv2's full staging stages every non-cached expert of a layer and asserts len(miss) <= stage_n at the
