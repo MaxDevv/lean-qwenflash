@@ -39,7 +39,7 @@ def _build():
     # Portable ISA flags (AVX2 + FMA + F16C is all the kernel uses); the campaign build used -march=znver3.
     isa = os.environ.get("QWEN38_CT_CFLAGS", "-mavx2 -mfma -mf16c -mtune=znver3").split()
     _H = load(name="ft_tier_host", sources=[os.path.join(_KDIR, "ft_tier_ext.cpp")], build_directory=d,
-              extra_cflags=["-O3", *isa, "-std=c++17", "-I" + _KDIR], extra_ldflags=["-lpthread"], verbose=False)
+              extra_cflags=["-O3", *isa, "-std=c++20", "-I" + _KDIR], extra_ldflags=["-lpthread"], verbose=False)
     _CU = load(name="ft_tier_cu", sources=[os.path.join(_KDIR, "ft_tier_cu.cu")], build_directory=d,
                extra_cuda_cflags=["-O3"], verbose=False)
 

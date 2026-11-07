@@ -56,7 +56,7 @@ def ext():
         d = os.environ.get("QWEN38_NV2_BUILD", os.path.join(root, "build", "nv2"))
         os.makedirs(d, exist_ok=True)
         _EXT = load(name="qwen38_nv2", sources=[os.path.join(here, "nv2_host.cpp"), os.path.join(here, "nv2_dev.cu")],
-                    build_directory=d, extra_cflags=["-O3", "-mavx2", "-mfma", "-mf16c", "-mtune=znver3", "-std=c++17",
+                    build_directory=d, extra_cflags=["-O3", "-mavx2", "-mfma", "-mf16c", "-mtune=znver3", "-std=c++20",
                                                      "-I" + here],
                     extra_cuda_cflags=["-O3", "-I" + here], extra_ldflags=["-lpthread"], verbose=False)
     return _EXT
