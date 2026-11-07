@@ -9,11 +9,17 @@ class HostMemory:
     """Sample cgroup RAM, including file cache, and enforce the runtime limit."""
     def __init__(self,path,limit=None):
         limit=int(os.environ.get('QWEN_RAM_LIMIT_BYTES','16000000000')) if limit is None else limit
-        self.path=Path(path); self.limit=limit; self.peak=0; self.running=True
+        self.path=Path(path); self.limit=limit; self.peak=0; self.running=True; self.thread=None
         # A preconfigured kernel RAM/swap cap is not required for inference.
         # The sampler below still enforces self.limit.
+        if not (self.path/'memory.current').exists():
+            # e.g. WSL's root cgroup, or a desktop session without a delegated memory controller: nothing to
+            # measure, so the RAM guard stays off.
+            print(f'RAM guard off: no memory.current in {self.path} (start inside a memory cgroup to enable it)',flush=True)
+            self.running=False; return
         self.thread=threading.Thread(target=self._run,daemon=True); self.thread.start()
     def sample(self):
+        if not (self.path/'memory.current').exists(): return 0
         used=int((self.path/'memory.current').read_text()); self.peak=max(self.peak,used)
         return used
     def _run(self):
@@ -23,7 +29,9 @@ class HostMemory:
                 os._exit(87)
             time.sleep(0.02)
     def close(self):
-        self.running=False; self.thread.join(); self.sample()
+        self.running=False
+        if self.thread: self.thread.join()
+        self.sample()
 
 class DeviceMemory:
     class Info(C.Structure):
