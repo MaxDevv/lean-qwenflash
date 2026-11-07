@@ -15,6 +15,8 @@ Endpoints
   GET  /health, /v1/models, /server_info, /stats
   POST /v1/chat/completions  (stream or not; tools -> tool_calls; chat_template_kwargs.enable_thinking /
                              reasoning_effort; reasoning in reasoning_content)
+  POST /v1/responses         (OpenAI Responses API on the same pipeline: stream or not, function tools,
+                             reasoning items, previous_response_id; see openai_responses.py)
   POST /v1/completions       (raw prompt, stream or not)
   POST /generate, /tokenize  (SGLang-shaped, used by the benchmark and quality tools; return_logprob = teacher-forced)
 No output caps: max_tokens defaults to the remaining context.
@@ -32,6 +34,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tool_stream import split_tool_stream
+from openai_compat import normalize_chat_request
+from openai_responses import RequestError, ResponseBuilder, responses_to_chat
 
 app = FastAPI()
 G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
@@ -369,87 +373,143 @@ def split_reasoning(text):
     return None, text.strip()
 
 
-@app.post("/v1/chat/completions")
-async def chat(req: Request):
-    body = await req.json()
+def prepare_chat(body):
+    """Prompt and generation settings for an OpenAI chat request (also behind /v1/responses)."""
+    body = normalize_chat_request(body)
     kw = dict(body.get("chat_template_kwargs") or {})
     if body.get("reasoning_effort") is not None:
         kw.setdefault("reasoning_effort", body["reasoning_effort"])
     thinking = kw.get("enable_thinking", True)
     tools = body.get("tools") if body.get("tool_choice") != "none" else None
     ids = tok.encode(chat_prompt(body["messages"], thinking, tools, kw), encode_special_tokens=True)
-    sp, stops = openai_sp(body), stops_of(body)
-    cid, created, P = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), ids.shape[-1]
-    if body.get("stream"):
-        async def events():
-            g = run_job(ids, sp, stops)
-            gone, wt = watch_disconnect(req)
-            sent, in_think, held = 0, thinking, ""
-            base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": args.served_name}
-            yield sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
-            n, fin = 0, None
-            try:
-                async for text, n, fin in g:
-                    new = text[sent:]
-                    hold = 0   # hold back a possible partial "</think>" at the end of the text
-                    if in_think and fin is None:
-                        for k in range(min(len("</think>") - 1, len(new)), 0, -1):
-                            if "</think>".startswith(new[-k:]):
-                                hold = k; break
-                    new = new[:len(new) - hold] if hold else new
-                    sent += len(new)
-                    while new:
-                        if in_think:
-                            r, sep, rest = new.partition("</think>")
-                            if r:
-                                yield sse(dict(base, choices=[{"index": 0, "delta": {"reasoning_content": r.replace("<think>", "")}, "finish_reason": None}]))
-                            if not sep:
-                                break
-                            in_think, new = False, rest
-                        elif tools:
-                            # Stream ordinary prose immediately. Hold only ambiguous opening-tag
-                            # prefixes and actual tool calls for the existing end-of-answer parser.
-                            content, held = split_tool_stream(held + new)
-                            if content:
-                                yield sse(dict(base, choices=[{"index": 0, "delta": {"content": content}, "finish_reason": None}]))
-                            break
-                        else:
-                            yield sse(dict(base, choices=[{"index": 0, "delta": {"content": new}, "finish_reason": None}]))
-                            break
-                    if fin is None and gone.is_set():
+    return {"body": body, "ids": ids, "thinking": thinking, "tools": tools, "sp": openai_sp(body),
+            "stops": stops_of(body)}
+
+
+async def chat_deltas(req, c):
+    """A streamed answer as deltas: ("reasoning", text), ("content", text), then ("tool_calls", calls) if it called
+    tools, and last ("end", finish_reason, completion_tokens)."""
+    g = run_job(c["ids"], c["sp"], c["stops"])
+    gone, wt = watch_disconnect(req)
+    sent, in_think, held, tools = 0, c["thinking"], "", c["tools"]
+    n, fin = 0, None
+    try:
+        async for text, n, fin in g:
+            new = text[sent:]
+            hold = 0   # hold back a possible partial "</think>" at the end of the text
+            if in_think and fin is None:
+                for k in range(min(len("</think>") - 1, len(new)), 0, -1):
+                    if "</think>".startswith(new[-k:]):
+                        hold = k; break
+            new = new[:len(new) - hold] if hold else new
+            sent += len(new)
+            while new:
+                if in_think:
+                    r, sep, rest = new.partition("</think>")
+                    if r:
+                        yield ("reasoning", r.replace("<think>", ""))
+                    if not sep:
                         break
-                reason = (fin or {}).get("type", "stop")
-                if tools:
-                    content, calls = parse_tool_calls(held, tools)
+                    in_think, new = False, rest
+                elif tools:
+                    # Stream ordinary prose immediately. Hold only ambiguous opening-tag
+                    # prefixes and actual tool calls for the existing end-of-answer parser.
+                    content, held = split_tool_stream(held + new)
                     if content:
-                        yield sse(dict(base, choices=[{"index": 0, "delta": {"content": content}, "finish_reason": None}]))
-                    if calls:
-                        reason = "tool_calls"
-                        yield sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]}, "finish_reason": None}]))
-                usage = {"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}
-                yield sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": reason}], usage=usage))
-                yield "data: [DONE]\n\n"
-            finally:
-                gone.set(); wt.cancel()
-                await g.aclose()
-        return StreamingResponse(events(), media_type="text/event-stream")
+                        yield ("content", content)
+                    break
+                else:
+                    yield ("content", new)
+                    break
+            if fin is None and gone.is_set():
+                break
+        reason = (fin or {}).get("type", "stop")
+        if tools:
+            content, calls = parse_tool_calls(held, tools)
+            if content:
+                yield ("content", content)
+            if calls:
+                reason = "tool_calls"
+                yield ("tool_calls", calls)
+        yield ("end", reason, n)
+    finally:
+        gone.set(); wt.cancel()
+        await g.aclose()
+
+
+async def chat_whole(c):
+    """The whole answer: (reasoning, content, tool calls, finish_reason, completion_tokens)."""
     text, n, fin = "", 0, None
-    async for text, n, fin in run_job(ids, sp, stops):
+    async for text, n, fin in run_job(c["ids"], c["sp"], c["stops"]):
         pass
-    if thinking:
+    if c["thinking"]:
         reasoning, content = split_reasoning(text)
         if reasoning is None:   # never closed the think block (e.g. hit max_tokens)
             reasoning, content = text.replace("<think>", "").strip(), ""
     else:
         reasoning, content = None, text.strip()
-    content, calls = parse_tool_calls(content, tools)
+    content, calls = parse_tool_calls(content, c["tools"])
+    return reasoning, content, calls, "tool_calls" if calls else (fin or {}).get("type"), n
+
+
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    c = prepare_chat(await req.json())
+    cid, created, P = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), c["ids"].shape[-1]
+    if c["body"].get("stream"):
+        async def events():
+            base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": args.served_name}
+            yield sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
+            d = chat_deltas(req, c)
+            try:
+                async for ev in d:
+                    if ev[0] == "end":
+                        usage = {"prompt_tokens": P, "completion_tokens": ev[2], "total_tokens": P + ev[2]}
+                        yield sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": ev[1]}], usage=usage))
+                        yield "data: [DONE]\n\n"
+                    elif ev[0] == "tool_calls":
+                        yield sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [dict(t, index=i) for i, t in enumerate(ev[1])]}, "finish_reason": None}]))
+                    else:
+                        key = "reasoning_content" if ev[0] == "reasoning" else "content"
+                        yield sse(dict(base, choices=[{"index": 0, "delta": {key: ev[1]}, "finish_reason": None}]))
+            finally:
+                await d.aclose()
+        return StreamingResponse(events(), media_type="text/event-stream")
+    reasoning, content, calls, reason, n = await chat_whole(c)
     msg = {"role": "assistant", "content": content, "reasoning_content": reasoning}
     if calls:
         msg["tool_calls"] = calls
     return JSONResponse({"id": cid, "object": "chat.completion", "created": created, "model": args.served_name,
-                         "choices": [{"index": 0, "message": msg,
-                                      "finish_reason": "tool_calls" if calls else (fin or {}).get("type")}],
+                         "choices": [{"index": 0, "message": msg, "finish_reason": reason}],
                          "usage": {"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}})
+
+
+@app.post("/v1/responses")
+async def responses(req: Request):
+    """OpenAI Responses API, translated onto the chat pipeline (openai_responses.py)."""
+    raw = await req.json()
+    try:
+        chat_body, convo = responses_to_chat(raw)
+    except RequestError as e:
+        return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": None,
+                                       "code": None}}, status_code=400)
+    c = prepare_chat(chat_body)
+    P = c["ids"].shape[-1]
+    rb = ResponseBuilder(raw, args.served_name, convo)
+    if raw.get("stream"):
+        async def events():
+            for e in rb.start():
+                yield e
+            d = chat_deltas(req, c)
+            try:
+                async for ev in d:
+                    for e in rb.feed(ev, P):
+                        yield e
+            finally:
+                await d.aclose()
+        return StreamingResponse(events(), media_type="text/event-stream")
+    reasoning, content, calls, reason, n = await chat_whole(c)
+    return JSONResponse(rb.whole(reasoning, content, calls, reason, P, n))
 
 
 @app.post("/v1/completions")

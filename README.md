@@ -105,7 +105,8 @@ Point tools like Pi, OpenCode, or Claude Code to:
 * **Model:** `qwen3.8-flash-next`
 * **Context Window:** `262144`
 
-Supports streaming, reasoning effort control (`off`, `low`, `medium`, `xhigh`), and OpenAI function calling.
+Supports streaming, reasoning effort control (`off`, `low`, `medium`, `xhigh`), and OpenAI function calling, on
+both Chat Completions (`/v1/chat/completions`) and the Responses API (`/v1/responses`).
 
 ### CLI Test
 To run a one-shot generation from the terminal:
