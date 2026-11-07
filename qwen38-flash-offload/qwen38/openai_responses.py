@@ -4,7 +4,9 @@ responses_to_chat() turns a Responses request into a chat request: input items b
 the system message, function tools chat tools, max_output_tokens max_tokens, reasoning.effort reasoning_effort.
 ResponseBuilder turns the chat pipeline's deltas into Responses server-sent events, or builds a whole Response.
 
-- Text only. Function tools are passed to the model. Built-in tools (web search, file search, computer use, MCP,
+- Text only. Function tools are passed to the model. tool_choice "none" leaves them out; a named function or
+  "required" is passed on but not enforced, as in /v1/chat/completions (the chat pipeline has no constrained
+  decoding), so the model may answer without a call. Built-in tools (web search, file search, computer use, MCP,
   custom/freeform tools) are not available, so they are left out.
 - The model's thinking comes back as a reasoning item with reasoning_text content (the gpt-oss/vLLM convention).
   Reasoning items sent back as input are skipped: the chat template drops earlier thinking anyway.
