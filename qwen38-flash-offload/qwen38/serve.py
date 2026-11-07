@@ -119,7 +119,7 @@ def load():
     hf_tok = None
     try:
         from transformers import AutoTokenizer
-        hf_tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
+        hf_tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=False)
     except Exception as e:
         print(f" !! HF tokenizer unavailable ({e}); chat endpoint uses the built-in GLM template", flush=True)
     CTX = args.cache_size
